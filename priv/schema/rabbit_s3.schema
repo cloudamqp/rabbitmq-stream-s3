@@ -92,7 +92,7 @@ end}.
 %% S3 tiered storage for Osiris.
 
 {mapping, "streams.log_reader", "osiris.log_reader", [
-    {datatype, {enum, [osiris_log_reader, rabbitmq_stream_s3_log_reader]}}
+    {datatype, {enum, [osiris_log, rabbitmq_stream_s3_log_reader]}}
 ]}.
 {mapping, "streams.log_manifest", "osiris.log_manifest", [
     {datatype, {enum, [osiris_log, rabbitmq_stream_s3_log_manifest]}}

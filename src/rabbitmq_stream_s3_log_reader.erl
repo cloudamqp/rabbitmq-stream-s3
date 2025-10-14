@@ -13,27 +13,53 @@
 -define(READAHEAD, "5MiB").
 -define(READ_TIMEOUT, 10000).
 
--record(state, {
-    connection_handle,
-    buf,
-    offset_start,
-    offset_end,
-    read_ahead,
-    bucket,
-    object,
-    object_size
+-record(remote, {
+    pid :: pid(),
+    dir :: file:filename_all(),
+    transport :: tcp | ssl,
+    next_offset :: osiris:offset(),
+    shared :: atomics:atomics_ref(),
+    fragment :: osiris:offset(),
+    position :: byte_offset(),
+    filter :: osiris_bloom:mstate() | undefined,
+    chunk_selector :: all | user_data
 }).
 
--type state() :: {local, file:io_device()} | {remote, pid()}.
+-record(?MODULE, {
+    config :: osiris_log_reader:config(),
+    mode :: #remote{} | osiris_log:state()
+}).
 
--export_type([state/0]).
+-record(remote_iterator, {
+    next_offset :: osiris:offset(),
+    data :: binary()
+}).
+
+-record(state, {
+    connection :: pid(),
+    buffer = <<>> :: binary(),
+    offset_start :: byte_offset(),
+    offset_end :: byte_offset(),
+    read_size :: pos_integer(),
+    bucket :: binary(),
+    object :: binary(),
+    object_size :: pos_integer()
+}).
 
 %% osiris_log_reader
--export([open/1, pread/4, sendfile/5, close/1]).
+-export([
+    init_offset_reader/2,
+    next_offset/1,
+    committed_offset/1,
+    close/1,
+    send_file/3,
+    chunk_iterator/3,
+    iterator_next/1
+]).
 
 %% gen_server
 -export([
-    start_link/2,
+    start_link/3,
     init/1,
     handle_call/3,
     handle_cast/2,
@@ -47,108 +73,222 @@
 %%% osiris_log_reader callbacks
 %%%===================================================================
 
-open(SegmentFile) ->
-    case osiris_log_reader:open(SegmentFile) of
-        {ok, Fd} ->
-            {ok, {local, Fd}};
-        {error, enoent} ->
-            {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
-            Key = fragment_key(SegmentFile),
-            case rabbitmq_stream_s3_log_reader_sup:add_child(Bucket, Key) of
-                {ok, Pid} ->
-                    {ok, {remote, Pid}};
-                {error, _} = Err ->
-                    Err
+init_offset_reader(first, #{dir := Dir, shared := Shared} = Config) ->
+    LocalFirstOffset = osiris_log_shared:first_chunk_id(Shared),
+    case rabbitmq_stream_s3_log_manifest:get_manifest(Dir) of
+        #manifest{first_offset = RemoteFirstOffset} when RemoteFirstOffset < LocalFirstOffset ->
+            ?LOG_DEBUG(
+                "Attaching remote reader at first offset ~b pos ~b for spec 'first'",
+                [RemoteFirstOffset, ?SEGMENT_HEADER_B]
+            ),
+            init_remote_reader(RemoteFirstOffset, ?SEGMENT_HEADER_B, RemoteFirstOffset, Config);
+        _ ->
+            init_local_reader(first, Config)
+    end;
+init_offset_reader(Offset, #{dir := Dir} = Config) when is_integer(Offset) ->
+    ?LOG_DEBUG(?MODULE_STRING ":~ts/2 finding offset ~b", [?FUNCTION_NAME, Offset]),
+    case init_local_reader({abs, Offset}, Config) of
+        {ok, _} = Ok ->
+            Ok;
+        {error, {offset_out_of_range, {_First, LastLocalOffset}}} when Offset > LastLocalOffset ->
+            ?LOG_DEBUG("requested offset ~b is higher than last local offset ~b", [
+                Offset, LastLocalOffset
+            ]),
+            %% TODO: try the remote tier? Or just attach to next?
+            init_local_reader(next, Config);
+        {error, {offset_out_of_range, Range}} ->
+            ?LOG_DEBUG("offset ~b is not local (local range ~w), trying the remote tier", [
+                Offset, Range
+            ]),
+            case rabbitmq_stream_s3_log_manifest:get_manifest(Dir) of
+                undefined ->
+                    init_local_reader(next, Config);
+                #manifest{first_offset = FirstOffset} when Offset < FirstOffset ->
+                    %% Emulate osiris_log's behavior: attach at the beginning
+                    %% of the stream.
+                    init_remote_reader(FirstOffset, ?SEGMENT_HEADER_B, FirstOffset, Config);
+                #manifest{} = Manifest ->
+                    {ok, ChunkId, Position, Fragment} = find_fragment_for_offset(
+                        Offset, Manifest, Dir
+                    ),
+                    init_remote_reader(Fragment, Position, ChunkId, Config)
             end;
         {error, _} = Err ->
             Err
-    end.
-
-pread({local, Fd} = Reader, Offset, Bytes, Hint) ->
-    case osiris_log_reader:pread(Fd, Offset, Bytes, Hint) of
-        {ok, Data, _} ->
-            {ok, Data, Reader};
-        eof ->
-            eof;
-        {error, _} = Err ->
-            Err
     end;
-pread({remote, _} = Reader, Offset, Bytes, within) ->
-    pread_remote(Reader, Offset, Bytes);
-pread({remote, _} = Reader, Offset, Bytes, boundary) ->
-    case pread_remote(Reader, Offset, Bytes) of
-        %% This chunk boundary is not a chunk boundary at all - it's the start
-        %% of the index.
-        {ok, <<?REMOTE_IDX_MAGIC, _Vsn:32/unsigned, _/binary>>, _} ->
-            eof;
-        Result ->
-            Result
-    end.
+init_offset_reader(OffsetSpec, Config) ->
+    %% TODO: implement the other offset specs
+    init_local_reader(OffsetSpec, Config).
 
-pread_remote({remote, Remote} = Reader, Offset, Bytes) ->
-    case gen_server:call(Remote, {pread, Offset, Bytes}, infinity) of
-        {ok, Data} ->
-            {ok, Data, Reader};
-        eof ->
-            eof;
-        {error, _} = Err ->
-            Err
-    end.
+next_offset(#?MODULE{mode = #remote{next_offset = NextOffset}}) ->
+    NextOffset;
+next_offset(#?MODULE{mode = Local}) ->
+    osiris_log:next_offset(Local).
 
-sendfile(Transport, {local, Fd} = Reader, Socket, Offset, Bytes) ->
-    case osiris_log_reader:sendfile(Transport, Fd, Socket, Offset, Bytes) of
-        {ok, _} ->
-            {ok, Reader};
-        {error, _} = Err ->
-            Err
+committed_offset(#?MODULE{mode = #remote{shared = Shared}}) ->
+    osiris_log_shared:committed_chunk_id(Shared);
+committed_offset(#?MODULE{mode = Local}) ->
+    osiris_log:committed_offset(Local).
+
+close(#?MODULE{mode = #remote{pid = Pid}}) ->
+    ok = gen_server:cast(Pid, close);
+close(#?MODULE{mode = Local}) ->
+    ok = osiris_log:close(Local).
+
+send_file(
+    Socket,
+    #?MODULE{
+        mode =
+            #remote{
+                pid = Pid,
+                transport = Transport,
+                chunk_selector = ChunkSelector
+            } = Remote0
+    } = State0,
+    Callback
+) ->
+    case read_header(Remote0) of
+        {ok,
+            #{
+                chunk_id := ChId,
+                num_records := NumRecords,
+                position := Position,
+                next_position := NextPosition,
+                header_data := HeaderData
+            } = Header,
+            Remote1} ->
+            {ToSkip, ToSend} = select_amount_to_send(ChunkSelector, Header),
+            DataPos = Position + ?CHUNK_HEADER_B + ToSkip,
+            PrefixData = Callback(Header, ToSend + byte_size(HeaderData)),
+            {ok, Data} = gen_server:call(Pid, {read, DataPos, ToSend, within_chunk}),
+            case send(Transport, Socket, [PrefixData, HeaderData, Data]) of
+                ok ->
+                    Remote = Remote1#remote{
+                        next_offset = ChId + NumRecords,
+                        position = NextPosition
+                    },
+                    {ok, State0#?MODULE{mode = Remote}};
+                {error, _} = Err ->
+                    Err
+            end;
+        {local, Remote} ->
+            case convert_remote_to_local(State0#?MODULE{mode = Remote}) of
+                {ok, State} ->
+                    send_file(Socket, State, Callback);
+                {error, _} = Err ->
+                    Err
+            end;
+        {end_of_stream, Remote} ->
+            {end_of_stream, State0#?MODULE{mode = Remote}}
     end;
-sendfile(Transport, {remote, Remote} = Reader, Socket, Offset, Bytes) ->
-    case gen_server:call(Remote, {pread, Offset, Bytes}, infinity) of
-        {ok, Data} ->
-            ok = send(Transport, Socket, Data),
-            {ok, Reader};
+send_file(Socket, #?MODULE{mode = Local0} = State0, Callback) ->
+    case osiris_log:send_file(Socket, Local0, Callback) of
+        {ok, Local} ->
+            State = State0#?MODULE{mode = Local},
+            {ok, State};
+        {end_of_stream, Local} ->
+            State = State0#?MODULE{mode = Local},
+            {end_of_stream, State};
         {error, _} = Err ->
             Err
     end.
 
-close({local, Fd}) ->
-    osiris_log_reader:close(Fd);
-close({remote, Pid}) ->
-    gen_server:cast(Pid, close).
+chunk_iterator(#?MODULE{mode = #remote{pid = Pid} = Remote0} = State0, Credit, _PrevIter) ->
+    case read_header(Remote0) of
+        {ok,
+            #{
+                chunk_id := ChId,
+                num_records := NumRecords,
+                position := Position,
+                next_position := NextPosition,
+                filter_size := FilterSize,
+                data_size := DataSize
+            } = Header,
+            Remote1} ->
+            DataPos = Position + ?CHUNK_HEADER_B + FilterSize,
+            {ok, Data} = gen_server:call(Pid, {read, DataPos, DataSize, within_chunk}),
+            Iter = #remote_iterator{
+                next_offset = ChId,
+                data = Data
+            },
+            Remote = Remote1#remote{
+                next_offset = ChId + NumRecords,
+                position = NextPosition
+            },
+            State = State0#?MODULE{mode = Remote},
+            {ok, Header, Iter, State};
+        {local, Remote} ->
+            case convert_remote_to_local(State0#?MODULE{mode = Remote}) of
+                {ok, State} ->
+                    chunk_iterator(State, Credit, undefined);
+                {error, _} = Err ->
+                    Err
+            end;
+        {end_of_stream, Remote} ->
+            {end_of_stream, State0#?MODULE{mode = Remote}}
+    end;
+chunk_iterator(#?MODULE{mode = Local0} = State0, Credit, PrevIter) ->
+    case osiris_log:chunk_iterator(Local0, Credit, PrevIter) of
+        {ok, Header, Iter, Local} ->
+            State = State0#?MODULE{mode = Local},
+            {ok, Header, Iter, State};
+        {end_of_stream, Local} ->
+            State = State0#?MODULE{mode = Local},
+            {end_of_stream, State};
+        {error, _} = Err ->
+            Err
+    end.
+
+iterator_next(#remote_iterator{next_offset = NextOffset0, data = Data0} = Iter0) ->
+    case Data0 of
+        ?REC_MATCH_SIMPLE(Len, Rem0) ->
+            <<Record:Len/binary, Rem>> = Rem0,
+            Iter = Iter0#remote_iterator{next_offset = NextOffset0 + 1, data = Rem},
+            {{NextOffset0, Record}, Iter};
+        ?REC_MATCH_SUBBATCH(CompType, NumRecs, UncompressedLen, Len, Rem0) ->
+            <<BatchData:Len/binary, Rem>> = Rem0,
+            Record = {batch, NumRecs, CompType, UncompressedLen, BatchData},
+            Iter = Iter0#remote_iterator{next_offset = NextOffset0 + NumRecs, data = Rem},
+            {{NextOffset0, Record}, Iter};
+        <<>> ->
+            end_of_chunk
+    end;
+iterator_next(Local) ->
+    osiris_log:iterator_next(Local).
 
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
-start_link(Bucket, Key) ->
-    gen_server:start_link(?MODULE, {Bucket, Key}, []).
+start_link(Reader, Bucket, Key) ->
+    gen_server:start_link(?MODULE, {Reader, Bucket, Key}, []).
 
-init({Bucket, Key}) ->
-    {ok, Handle} = rabbitmq_aws:open_connection("s3", []),
+init({Reader, Bucket, Key}) ->
+    erlang:monitor(process, Reader),
+    {ok, Connection} = rabbitmq_aws:open_connection("s3", []),
     Size = rabbitmq_stream_s3_api:get_object_size(
-        Handle,
+        Connection,
         Bucket,
         Key,
         [{timeout, ?READ_TIMEOUT}]
     ),
-    {ok, ReadAhead} =
+    {ok, ReadSize} =
         rabbit_resource_monitor_misc:parse_information_unit(?READAHEAD),
     {ok, #state{
-        connection_handle = Handle,
-        %% NOTE: the fragment file may not be read from the beginning (for
-        %% example to skip the header) so we shouldn't eagerly pre-read from
-        %% the beginning here.
-        buf = <<>>,
+        connection = Connection,
         bucket = Bucket,
         object = Key,
         object_size = Size,
-        read_ahead = ReadAhead
+        read_size = ReadSize
     }}.
 
-handle_call({pread, Offset, Bytes}, _From, State0) ->
+handle_call({read, Offset, Bytes, Hint}, _From, State0) ->
     %% TODO: while reading, start a request for the next range of data when
     %% we near the end of the current section.
-    case do_pread(State0, Offset, Bytes) of
+    case do_read(State0, Offset, Bytes) of
+        {State, ?IDX_HEADER(_)} when Hint =:= chunk_boundary ->
+            %% The reader has reached the section of the
+            {reply, eof, State};
         {State, Data} ->
             {reply, {ok, Data}, State};
         eof ->
@@ -163,17 +303,19 @@ handle_cast(Message, State) ->
     ?LOG_DEBUG(?MODULE_STRING " received unexpected cast: ~W", [Message, 10]),
     {noreply, State}.
 
+handle_info({'DOWN', _Ref, process, _Pid, _Reason}, State) ->
+    {stop, normal, State};
 handle_info(Message, State) ->
     ?LOG_DEBUG(?MODULE_STRING " received unexpected message: ~W", [Message, 10]),
     {noreply, State}.
 
-terminate(_Reason, #state{connection_handle = Handle}) ->
-    ok = rabbitmq_aws:close_connection(Handle).
+terminate(_Reason, #state{connection = Connection}) ->
+    ok = rabbitmq_aws:close_connection(Connection).
 
-format_status(#{state := #state{buf = Buf} = State0} = Status0) ->
+format_status(#{state := #state{buffer = Buffer} = State0} = Status0) ->
     %% Avoid formatting the buffer - it can be large.
-    Size = lists:flatten(io_lib:format("~b bytes", [byte_size(Buf)])),
-    Status0#{state := State0#state{buf = Size}}.
+    Size = lists:flatten(io_lib:format("~b bytes", [byte_size(Buffer)])),
+    Status0#{state := State0#state{buffer = Size}}.
 
 code_change(_, _, State) ->
     {ok, State}.
@@ -181,25 +323,28 @@ code_change(_, _, State) ->
 %%---------------------------------------------------------------------------
 %% Helpers
 
-fragment_key(File) ->
-    [SegmentBasename, StreamName | _] = lists:reverse(filename:split(File)),
-    Suffix = string:replace(SegmentBasename, ".segment", ".fragment", trailing),
-    iolist_to_binary(["rabbitmq/stream/", StreamName, "/data/", Suffix]).
+%% fragment_key(File) ->
+%%     [SegmentBasename, StreamName | _] = lists:reverse(filename:split(File)),
+%%     Suffix = string:replace(SegmentBasename, ".segment", ".fragment", trailing),
+%%     iolist_to_binary(["rabbitmq/stream/", StreamName, "/data/", Suffix]).
 
 send(tcp, Socket, Data) ->
     gen_tcp:send(Socket, Data);
 send(ssl, Socket, Data) ->
     ssl:send(Socket, Data).
 
-do_pread(#state{object_size = Size}, Offset, _Bytes) when Offset >= Size ->
+do_read(#state{object_size = Size}, Offset, _Bytes) when Offset >= Size ->
+    %% TODO: store the segment data size in the prelude of a fragment so that
+    %% we know eof accurately. This branch is never hit, currently, because we
+    %% store the index at the end of the fragment.
     eof;
-do_pread(
+do_read(
     #state{
-        connection_handle = Handle,
+        connection = Connection,
         bucket = Bucket,
         object = Object,
-        buf = Buf,
-        read_ahead = ReadAhead,
+        buffer = Buffer,
+        read_size = ReadSize,
         offset_start = BufStart,
         offset_end = BufEnd
     } = State0,
@@ -211,21 +356,324 @@ do_pread(
         % Data is in buffer
         true ->
             OffsetInBuf = Offset - BufStart,
-            {State0, binary:part(Buf, OffsetInBuf, Bytes)};
+            {State0, binary:part(Buffer, OffsetInBuf, Bytes)};
         false ->
-            ToRead = max(ReadAhead, Bytes),
-            {ok, NewBuf} = rabbitmq_stream_s3_api:get_object_with_range(
-                Handle,
+            ToRead = max(ReadSize, Bytes),
+            {ok, NewBuffer} = rabbitmq_stream_s3_api:get_object_with_range(
+                Connection,
                 Bucket,
                 Object,
                 {Offset, Offset + ToRead - 1},
                 [{timeout, ?READ_TIMEOUT}]
             ),
-            rabbitmq_stream_s3_counters:read_bytes(byte_size(NewBuf)),
+            rabbitmq_stream_s3_counters:read_bytes(byte_size(NewBuffer)),
             State = State0#state{
-                buf = NewBuf,
+                buffer = NewBuffer,
                 offset_start = Offset,
                 offset_end = Offset + ToRead - 1
             },
-            {State, binary:part(NewBuf, 0, Bytes)}
+            {State, binary:part(NewBuffer, 0, Bytes)}
+    end.
+
+%% This helper is mostly the same as osiris_log:read_header0/1. There are some
+%% simplifications:
+%% * Always over-read the chunk header so that we also read the chunk filter in
+%%   a single read operation.
+%% * Check the chunk selector within this helper. osiris_log does this in the
+%%   callers, but we can always skip when the chunk selector doesn't match.
+-spec read_header(#remote{}) ->
+    {ok, osiris_log:header_map(), #remote{}}
+    | {local, #remote{}}
+    | {end_of_stream, #remote{}}.
+read_header(#remote{shared = Shared, next_offset = NextOffset} = Remote) ->
+    CanReadNext =
+        osiris_log_shared:last_chunk_id(Shared) >= NextOffset andalso
+            osiris_log_shared:committed_chunk_id(Shared) >= NextOffset,
+    case CanReadNext of
+        true ->
+            read_header1(Remote);
+        false ->
+            {end_of_stream, Remote}
+    end.
+
+read_header1(
+    #remote{pid = Pid0, dir = Dir, position = Position, next_offset = NextChId, shared = Shared} =
+        Remote0
+) ->
+    %% Over-read the chunk header so that the filter (if it exists) is always
+    %% included in the binary. Reading from the remote tier takes time, so
+    %% over-reading is faster.
+    %% TODO: make sure that over-reading is handled gracefully: as much of the
+    %% binary should be returned as possible.
+    case
+        gen_server:call(
+            Pid0,
+            {read, Position, ?CHUNK_HEADER_B + ?MAX_FILTER_SIZE, chunk_boundary},
+            infinity
+        )
+    of
+        {ok, Header} ->
+            read_header2(Remote0, Header);
+        eof ->
+            FirstChId = osiris_log_shared:first_chunk_id(Shared),
+            LastChId = osiris_log_shared:last_chunk_id(Shared),
+            case NextChId of
+                FirstChId ->
+                    {local, Remote0};
+                _ when NextChId > LastChId ->
+                    {end_of_stream, Remote0};
+                _ ->
+                    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
+                    %% TODO: what if retention takes away fragments? We need to
+                    %% jump ahead to the start of the log.
+                    Key = rabbitmq_stream_s3_log_manifest:fragment_key(Dir, NextChId),
+                    case rabbitmq_stream_s3_log_reader_sup:add_child(self(), Bucket, Key) of
+                        {ok, Pid} ->
+                            ok = gen_server:cast(Pid0, close),
+                            Remote = Remote0#remote{
+                                pid = Pid,
+                                fragment = NextChId,
+                                position = ?SEGMENT_HEADER_B
+                            },
+                            read_header1(Remote);
+                        {error, not_found} ->
+                            {end_of_stream, Remote0}
+                    end
+            end
+    end.
+
+read_header2(
+    #remote{
+        next_offset = NextChId0,
+        position = Position0,
+        chunk_selector = ChunkSelector,
+        filter = Filter0
+    } = Remote0,
+    HeaderBin
+) ->
+    <<HeaderBin1:?CHUNK_HEADER_B/binary, _/binary>> = HeaderBin, 
+    {ok, Header} = osiris_log:parse_header(HeaderBin1, Position0),
+    #{
+        type := ChunkType,
+        chunk_id := NextChId0,
+        num_records := NumRecords,
+        next_position := NextPosition,
+        filter_size := FilterSize
+    } = Header,
+    case is_chunk_selected(ChunkSelector, ChunkType) of
+        true ->
+            ChunkFilter = binary:part(HeaderBin, ?CHUNK_HEADER_B, FilterSize),
+            case is_bloom_match(ChunkFilter, Filter0) of
+                true ->
+                    {ok, Header, Remote0};
+                false ->
+                    %% skip and recurse
+                    Remote = Remote0#remote{
+                        next_offset = NextChId0 + NumRecords,
+                        position = NextPosition
+                    },
+                    read_header(Remote);
+                {retry_with, Filter} ->
+                    read_header(Remote0#remote{filter = Filter})
+            end;
+        false ->
+            %% skip and recurse
+            Remote = Remote0#remote{
+                next_offset = NextChId0 + NumRecords,
+                position = NextPosition
+            },
+            read_header(Remote)
+    end.
+
+is_bloom_match(ChunkFilter, Filter0) ->
+    case osiris_bloom:is_match(ChunkFilter, Filter0) of
+        true ->
+            true;
+        false ->
+            false;
+        {retry_with, Filter} ->
+            is_bloom_match(ChunkFilter, Filter)
+    end.
+
+is_chunk_selected(all, _ChunkType) ->
+    true;
+is_chunk_selected(user_data, ?CHNK_USER) ->
+    true;
+is_chunk_selected(_ChunkSelector, _ChunkType) ->
+    false.
+
+select_amount_to_send(user_data, #{
+    type := ?CHNK_USER, filter_size := FilterSize, data_size := DataSize
+}) ->
+    {FilterSize, DataSize};
+select_amount_to_send(_ChunkSelector, #{
+    filter_size := FilterSize, data_size := DataSize, trailer_size := TrailerSize
+}) ->
+    {FilterSize, DataSize + TrailerSize}.
+
+init_local_reader(OffsetSpec, Config) ->
+    case osiris_log:init_offset_reader(OffsetSpec, Config) of
+        {ok, Local} ->
+            {ok, #?MODULE{config = Config, mode = Local}};
+        {error, _} = Err ->
+            Err
+    end.
+
+init_remote_reader(
+    Fragment, Position, Offset, #{dir := Dir, options := Options, shared := Shared} = Config
+) ->
+    Filter =
+        case Options of
+            #{filter_spec := FilterSpec} ->
+                osiris_bloom:init_matcher(FilterSpec);
+            _ ->
+                undefined
+        end,
+    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
+    Key = rabbitmq_stream_s3_log_manifest:fragment_key(Dir, Fragment),
+    case rabbitmq_stream_s3_log_reader_sup:add_child(self(), Bucket, Key) of
+        {ok, Pid} ->
+            Reader = #?MODULE{
+                config = Config,
+                mode = #remote{
+                    pid = Pid,
+                    dir = Dir,
+                    transport = maps:get(transport, Options, tcp),
+                    next_offset = Offset,
+                    shared = Shared,
+                    fragment = Fragment,
+                    position = Position,
+                    filter = Filter,
+                    chunk_selector = maps:get(chunk_selector, Options, user_data)
+                }
+            },
+            {ok, Reader};
+        {error, _} = Err ->
+            Err
+    end.
+
+convert_remote_to_local(#?MODULE{config = Config, mode = #remote{pid = Pid, next_offset = NextOffset}}) ->
+    ?LOG_DEBUG("Converting to local reader at offset ~b", [NextOffset]),
+    ok = gen_server:cast(Pid, close),
+    init_local_reader(first, Config).
+
+%% TODO: make this generic for timestamps too.
+-spec find_fragment_for_offset(osiris:offset(), #manifest{}, file:filename_all()) ->
+    {ok, ChunkId :: osiris:offset(), byte_offset(), Fragment :: osiris:offset()}.
+find_fragment_for_offset(Offset, #manifest{entries = Entries}, Dir) ->
+    RootIdx0 =
+        rabbitmq_stream_s3_binary_array:partition_point(
+            fun(?ENTRY(O, _T, _K, _S, _N, _)) -> Offset > O end,
+            ?ENTRY_B,
+            Entries
+        ),
+    RootIdx = saturating_decr(RootIdx0),
+    ?ENTRY(EntryOffset, _, Kind, _, _, _) = rabbitmq_stream_s3_binary_array:at(
+        RootIdx, ?ENTRY_B, Entries
+    ),
+    ?LOG_DEBUG("partition-point ~b for offset ~b is entry ~b", [
+        RootIdx,
+        Offset,
+        EntryOffset
+    ]),
+    case Kind of
+        ?MANIFEST_KIND_FRAGMENT ->
+            ?LOG_DEBUG("Searching for offset ~b within fragment ~b", [Offset, EntryOffset]),
+            %% TODO: pass in size now that we have it.
+            {ok, #fragment_info{index_start_pos = IdxStartPos}} = fragment_trailer(
+                Dir, EntryOffset
+            ),
+            Index = index_data(Dir, EntryOffset, IdxStartPos),
+            IndexIdx0 =
+                rabbitmq_stream_s3_binary_array:partition_point(
+                    fun(?INDEX_RECORD(O, _T, _P)) -> Offset >= O end,
+                    ?INDEX_RECORD_B,
+                    Index
+                ),
+            IndexIdx = saturating_decr(IndexIdx0),
+            ?INDEX_RECORD(ChunkId, _, Pos) =
+                rabbitmq_stream_s3_binary_array:at(IndexIdx, ?INDEX_RECORD_B, Index),
+            ?LOG_DEBUG(
+                "partition-point ~b for offset ~b is chunk id ~b, pos ~b", [
+                    IndexIdx,
+                    Offset,
+                    ChunkId,
+                    Pos
+                ]
+            ),
+            ?LOG_DEBUG("Attaching to offset ~b, pos ~b, fragment ~ts", [Offset, Pos, EntryOffset]),
+            {ok, ChunkId, Pos, EntryOffset};
+        _ ->
+            %% Download the group and search recursively within that.
+            ?LOG_DEBUG("Entry is not a fragment. Searching within group ~b kind ~b", [
+                EntryOffset, Kind
+            ]),
+            <<
+                _:4/binary,
+                _:32,
+                EntryOffset:64/unsigned,
+                _:64,
+                0:2/unsigned,
+                _:70,
+                GroupEntries/binary
+            >> = get_group(Dir, Kind, EntryOffset),
+            find_fragment_for_offset(Dir, Offset, GroupEntries)
+    end.
+
+saturating_decr(0) -> 0;
+saturating_decr(N) -> N - 1.
+
+fragment_trailer(Dir, FragmentOffset) ->
+    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
+    {ok, Handle} = rabbitmq_aws:open_connection("s3"),
+    Key = rabbitmq_stream_s3_log_manifest:fragment_key(Dir, FragmentOffset),
+    ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
+    try
+        rabbitmq_stream_s3_api:get_object_with_range(
+            Handle, Bucket, Key, -?FRAGMENT_TRAILER_B, [{timeout, ?READ_TIMEOUT}]
+        )
+    of
+        {ok, Data} ->
+            {ok, rabbitmq_stream_s3_log_manifest:fragment_trailer_to_info(Data)};
+        {error, _} = Err ->
+            Err
+    after
+        ok = rabbitmq_aws:close_connection(Handle)
+    end.
+
+index_data(Dir, FragmentOffset, StartPos) ->
+    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
+    {ok, Handle} = rabbitmq_aws:open_connection("s3"),
+    Key = rabbitmq_stream_s3_log_manifest:fragment_key(Dir, FragmentOffset),
+    ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
+    try
+        {ok, Data} = rabbitmq_stream_s3_api:get_object_with_range(
+            Handle, Bucket, Key, {StartPos, undefined}, [{timeout, ?READ_TIMEOUT}]
+        ),
+        binary:part(Data, 0, byte_size(Data) - ?FRAGMENT_TRAILER_B)
+    after
+        ok = rabbitmq_aws:close_connection(Handle)
+    end.
+
+get_group(Dir, Kind, GroupOffset) ->
+    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
+    {ok, Handle} = rabbitmq_aws:open_connection("s3"),
+    Key = rabbitmq_stream_s3_log_manifest:group_key(Dir, Kind, GroupOffset),
+    ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
+    try
+        {ok, Data} = rabbitmq_stream_s3_api:get_object(
+            Handle, Bucket, Key, [{timeout, ?READ_TIMEOUT}]
+        ),
+        <<
+            _Magic:4/binary,
+            _Vsn:32/unsigned,
+            GroupOffset:64/unsigned,
+            _FirstTimestamp:64/unsigned,
+            0:2/unsigned,
+            _TotalSize:70/unsigned,
+            _GroupEntries/binary
+        >> = Data,
+        Data
+    after
+        ok = rabbitmq_aws:close_connection(Handle)
     end.

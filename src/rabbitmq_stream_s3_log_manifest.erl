@@ -6,7 +6,6 @@
 %% TODO: this is just for testing.
 -export([recover_fragments/1]).
 
--include_lib("osiris/src/osiris.hrl").
 -include_lib("kernel/include/logger.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
@@ -17,11 +16,11 @@
 -behaviour(osiris_log_manifest).
 -behaviour(gen_server).
 
--define(LOG_HEADER_HASH, erlang:crc32(?LOG_HEADER)).
+-define(SEGMENT_HEADER_HASH, erlang:crc32(?SEGMENT_HEADER)).
 
 -record(fragment, {
     segment_offset :: osiris:offset(),
-    segment_pos = ?LOG_HEADER_SIZE :: pos_integer(),
+    segment_pos = ?SEGMENT_HEADER_B :: pos_integer(),
     %% Number of chunks in prior fragments and number in current fragment.
     num_chunks = {0, 0} :: {non_neg_integer(), non_neg_integer()},
     first_offset :: osiris:offset() | undefined,
@@ -33,7 +32,7 @@
     %% NOTE: header size is not included.
     size = 0 :: non_neg_integer(),
     %% TODO: do checksum during upload if undefined.
-    checksum = ?LOG_HEADER_HASH :: checksum() | undefined
+    checksum = ?SEGMENT_HEADER_HASH :: checksum() | undefined
 }).
 
 -record(writer, {
@@ -60,17 +59,9 @@
 
 -record(manifest_writer, {
     type :: writer | acceptor,
-    local :: osiris_log:manifest(),
     %% Only defined for writers:
     writer_ref :: writer_ref() | undefined,
     fragment :: #fragment{} | undefined
-}).
-
--record(manifest, {
-    first_offset :: osiris:offset(),
-    first_timestamp :: osiris:timestamp(),
-    total_size :: non_neg_integer(),
-    entries :: binary()
 }).
 
 %% NOTE: Pending is reversed.
@@ -98,8 +89,7 @@
     writer_manifest/1,
     acceptor_manifest/2,
     overview/1,
-    find_data_reader_position/2,
-    find_offset_reader_position/2,
+    recover_tracking/3,
     handle_event/2,
     close_manifest/1,
     delete/1
@@ -118,12 +108,14 @@
 
 -export([start/0, format_osiris_event/1]).
 
+-export([get_manifest/1]).
+
 %% Useful to search module.
 -export([fragment_key/2, group_key/3, make_file_name/2, fragment_trailer_to_info/1]).
 
 %% This server needs to be started by a boot step so that it is online before
 %% the stream coordinator. Otherwise the stream coordinator will attempt to
-%% recover replicas before this server is started and init_manifest/2 will
+%% recover replicas before this server is started and writer_manifest/1 will
 %% fail a few times and look messy in the logs.
 
 -rabbit_boot_step(
@@ -136,16 +128,29 @@
 ).
 
 start() ->
+    {ok, _} = application:ensure_all_started(rabbitmq_aws),
+
+    %% TODO: only set these when they are configured.
+    {ok, AccessKey} = application:get_env(rabbitmq_stream_s3, aws_access_key),
+    {ok, SecretKey} = application:get_env(rabbitmq_stream_s3, aws_secret_key),
+    {ok, Region} = application:get_env(rabbitmq_stream_s3, aws_region),
+    ok = rabbitmq_aws:set_credentials(AccessKey, SecretKey),
+    ok = rabbitmq_aws:set_region(Region),
+
     ok = rabbitmq_stream_s3_counters:init(),
     rabbit_sup:start_child(?MODULE).
 
+-spec get_manifest(file:filename_all()) -> #manifest{} | undefined.
+get_manifest(Dir) ->
+    gen_server:call(?SERVER, {get_manifest, Dir}, infinity).
+
 %%----------------------------------------------------------------------------
 
-handle_event(Event, #manifest_writer{local = Local0, type = acceptor} = Manifest0) ->
-    Manifest0#manifest_writer{local = osiris_log:handle_event(Event, Local0)};
+handle_event(_Event, #manifest_writer{type = acceptor} = Manifest) ->
+    Manifest;
 handle_event(
-    {segment_opened, RolledSegment, NewSegment} = Event,
-    #manifest_writer{local = Local0, writer_ref = WriterRef, fragment = Fragment0} = Manifest0
+    {segment_opened, RolledSegment, NewSegment},
+    #manifest_writer{writer_ref = WriterRef, fragment = Fragment0} = Manifest0
 ) ->
     Fragment =
         %% Submit the fragment for the rolled segment (if there actually is one) to
@@ -172,15 +177,10 @@ handle_event(
                 end,
                 #fragment{segment_offset = segment_file_offset(NewSegment)}
         end,
-    Manifest0#manifest_writer{
-        local = osiris_log:handle_event(Event, Local0),
-        fragment = Fragment
-    };
+    Manifest0#manifest_writer{fragment = Fragment};
 handle_event(
-    {chunk_written, #chunk_info{id = ChId, timestamp = Ts, num = NumRecords, size = ChunkSize},
-        Chunk} = Event,
+    {chunk_written, #{id := ChId, timestamp := Ts, num := NumRecords, size := ChunkSize}, Chunk},
     #manifest_writer{
-        local = Local0,
         writer_ref = WriterRef,
         fragment =
             #fragment{
@@ -231,10 +231,7 @@ handle_event(
             false ->
                 Fragment2
         end,
-    Manifest0#manifest_writer{
-        local = osiris_log:handle_event(Event, Local0),
-        fragment = Fragment
-    };
+    Manifest0#manifest_writer{fragment = Fragment};
 handle_event({retention_updated, _Retention}, #manifest_writer{} = Manifest) ->
     %% TODO
     Manifest.
@@ -245,111 +242,32 @@ checksum(Checksum, Data) ->
     erlang:crc32(Checksum, Data).
 
 writer_manifest(#{dir := Dir, reference := Ref} = Config0) ->
-    %% TODO: upon init the writer needs to figure out what was uploaded to S3
-    %% unsuccessfully given their local log.
     Config = Config0#{max_segment_size_bytes := ?MAX_SEGMENT_SIZE_BYTES},
-    {LocalInfo, _, Local} = osiris_log:writer_manifest(Config),
-    %% We only need two keys:
     Remote = gen_server:call(?SERVER, {init_writer, Ref, Dir}),
-    ?LOG_DEBUG("Recovering stream ~ts", [Dir]),
-    Fragment = recover_fragment(Dir, Ref, LocalInfo, Remote),
+    ?LOG_DEBUG("Recovering manifest for stream ~ts", [Dir]),
+    Fragment = recover_manifest(Dir, Ref, Remote),
     Manifest = #manifest_writer{
         type = writer,
-        local = Local,
         writer_ref = Ref,
         fragment = Fragment
     },
-    {merge_writer_info(LocalInfo, Remote), Config, Manifest}.
+    {Manifest, Config}.
 
-%% TODO: it doesn't matter that the manifest itself is undefined. We can
-%% upload segments when creating a stream and then the manifest could fail
-%% to be written. So we need to attempt to find 00000...000.fragment anyways.
-recover_fragment(_Dir, _Ref, #{num_segments := 0}, undefined) ->
-    ?LOG_DEBUG("Fully empty stream"),
-    %% Empty stream, nothing to recover.
-    #fragment{segment_offset = 0, seq_no = 0};
-recover_fragment(_Dir, _Ref, #{num_segments := 0}, _) ->
-    ?LOG_DEBUG("Empty local stream but remote has stuff"),
-    %% TODO: can we recover from this as a writer?
-    exit({todo, ?FUNCTION_NAME, no_local_data});
-recover_fragment(
-    _Dir,
-    _Ref,
-    #{
-        active_segment := #{
-            size := Size,
-            chunks := NumChunks,
-            first := #chunk_info{id = FirstChId, timestamp = FirstTs},
-            last := #chunk_info{id = LastChId, num = Num}
-        }
-    },
-    undefined
-) when Size < ?MAX_FRAGMENT_SIZE_B ->
-    ?LOG_DEBUG("Local active segment is smaller than a fragment"),
-    %% This first segment is smaller than a fragment. Use this part of the
-    %% segment as-is. We can avoid reading the index file at all in this case.
-    F = #fragment{
-        segment_offset = FirstChId,
-        num_chunks = {0, NumChunks},
-        first_offset = FirstChId,
-        first_timestamp = FirstTs,
-        last_offset = LastChId,
-        next_offset = LastChId + Num,
-        seq_no = 0,
-        size = Size - ?LOG_HEADER_SIZE,
-        checksum = undefined
-    },
-    ?LOG_DEBUG("Recovered fragment ~w", [F]),
-    F;
-recover_fragment(
-    _Dir,
-    Ref,
-    #{
-        active_segment := #{
-            file := File, size := SegmentSize, last := #chunk_info{id = LastChId, num = Num}
-        }
-    },
-    undefined
-) ->
-    ?LOG_DEBUG("Recovering fragments from active segment (not published)"),
-    NextOffset = LastChId + Num,
-    %% The manifest was never successfully written. Queue fragments for upload
-    %% now and figure out the currently active fragment.
-    {Fragment0, Fragments} = recover_fragments(File),
-    _ = [ok = gen_server:cast(?SERVER, {fragment, Ref, F}) || F <- Fragments],
-    %% next_offset and size are filled in with the info from active_segment.
-    Size = SegmentSize - Fragment0#fragment.segment_pos,
-    F = Fragment0#fragment{next_offset = NextOffset, size = Size},
-    ?LOG_DEBUG("Recovered active fragment ~w, existing fragments ~w", [F, Fragments]),
-    F;
-recover_fragment(
-    Dir,
-    Ref,
-    #{active_segment := #{last := #chunk_info{id = LastChId}}},
-    #manifest{entries = Entries}
-) ->
-    ?LOG_DEBUG("There are local segments and remote fragments"),
-    {LastTieredFragmentChId, PendingInfos} = rabbitmq_stream_s3_log_manifest_search:recover_fragments(
-        Dir, Entries
-    ),
-    %% Assert that the last tiered offset is less than last chunk ID here.
-    %% If it isn't we might be able to recover by creating a segment out of
-    %% fragments?
-    ?LOG_DEBUG("Local segment last is ~b and last fragment is ~b, recovered pending: ~w", [
-        LastChId, LastTieredFragmentChId, PendingInfos
-    ]),
-    ?assert(LastTieredFragmentChId < LastChId),
-    %% TODO: the manifest server needs to ignore fragment infos which it knows
-    %% are already tiered.
-    _ = [ok = gen_server:cast(?SERVER, {fragment_uploaded, Ref, I}) || I <- PendingInfos],
-    exit({todo, ?FUNCTION_NAME, the_hard_case}).
+recover_manifest(_Dir, _Ref, _RemoteManifest) ->
+    %% TODO:
+    %% * Examine the currently active segment in order to reconstruct the
+    %%   pending fragment information.
+    %% * Examine the last fragment uploaded to the remote manifest. Send
+    %%   `#fragment{}`s to the manifest server for any completed fragments
+    %%   in the local log which weren't yet uploaded (or their upload failed).
+    #fragment{segment_offset = 0, seq_no = 0}.
 
 recover_fragments(File) ->
-    ?LOG_DEBUG("Recoving fragments from segment file ~ts", [File]),
+    ?LOG_DEBUG("Recovering fragments from segment file ~ts", [File]),
     SegmentOffset = segment_file_offset(File),
     IdxFile = iolist_to_binary(string:replace(File, ".segment", ".index", trailing)),
     %% TODO: we should be reading in smaller chunks with pread.
-    {ok, <<_:?IDX_HEADER_SIZE/binary, IdxArray/binary>>} = file:read_file(IdxFile),
+    {ok, <<_:?IDX_HEADER_B/binary, IdxArray/binary>>} = file:read_file(IdxFile),
     recover_fragments(
         ?MAX_FRAGMENT_SIZE_B,
         SegmentOffset,
@@ -369,7 +287,6 @@ recover_fragments(
 ) ->
     FragmentBoundary = rabbitmq_stream_s3_binary_array:partition_point(
         fun(<<_ChId:64, _Ts:64, _E:64, FilePos:32/unsigned, _ChT:8>>) ->
-            %% ?LOG_DEBUG("testing ~b > ~b", [Threshold0, FilePos]),
             Threshold0 > FilePos
         end,
         ?INDEX_RECORD_SIZE_B,
@@ -425,31 +342,6 @@ recover_fragments(
             recover_fragments(Threshold, SegmentOffset, SeqNo, NumChunks, Fragments, Rest)
     end.
 
-merge_writer_info(#{num_segments := 0}, undefined) ->
-    %% Totally empty stream.
-    #{num_segments => 0};
-merge_writer_info(#{num_segments := 0}, _) ->
-    %% TODO: this should not really be possible except theoretically. Think
-    %% about if we want to allow this case.
-    exit(empty_writer_with_content_in_remote_tier);
-merge_writer_info(Local, undefined) ->
-    Local;
-merge_writer_info(
-    #{num_segments := NLocalSegs, active_segment := ActiveSegment},
-    #manifest{first_offset = FirstOffset, first_timestamp = FirstTimestamp}
-) ->
-    %% TODO: this is simple. Think about edge cases. I'm assuming that the
-    %% remote tier starts further back that the local log (or at the same
-    %% point).
-    #{
-        %% Dummy value. Screw it, it's only used for counters. We could make
-        %% our own counters if we really wanted.
-        num_segments => NLocalSegs,
-        first_offset => FirstOffset,
-        first_timestamp => FirstTimestamp,
-        active_segment => ActiveSegment
-    }.
-
 overview(Dir) ->
     LocalOverview = osiris_log:overview(Dir),
     ?LOG_DEBUG("Local overview: ~w", [LocalOverview]),
@@ -464,99 +356,32 @@ overview(Dir) ->
             maps:merge(LocalOverview, Info)
     end.
 
+recover_tracking(Trk0, SegmentFile, #manifest_writer{}) ->
+    %% TODO: we must check if the segment file is sparse. If it is, we need to
+    %% recover tracking from the remote tier. See how this function is defined
+    %% in osiris_log: we need to read through the chunks and use
+    %% `osiris_tracking:init/2` on snapshot-type chunks and
+    %% `osiris_tracking:append_trailer/3` on tracking delta chunks or any
+    %% user chunks with trailers. We should be able to reuse the gen_server
+    %% from this module to perform the necessary reads.
+    osiris_log:recover_tracking(Trk0, SegmentFile, undefined).
+
 acceptor_manifest(Overview0, #{dir := Dir, epoch := Epoch} = Config0) ->
     ?LOG_DEBUG("acceptor got remote overview: ~w", [Overview0]),
     Config = Config0#{max_segment_size_bytes := ?MAX_SEGMENT_SIZE_BYTES},
     case list_dir(Dir) of
         [] ->
-            Overview =
-                case Overview0 of
-                    #{last_tiered_fragment_offset := LTFO, last_tiered_segment_offset := LTSO} ->
-                        NextOffset = create_sparse_segment(Dir, Epoch, LTSO, LTFO),
-                        Overview0#{epoch_offsets := [{Epoch, NextOffset}]};
-                    _ ->
-                        Overview0
-                end,
-            {LocalInfo, _, Local} = osiris_log:acceptor_manifest(Overview, Config),
-            Manifest = #manifest_writer{
-                type = acceptor,
-                local = Local
-            },
-            {LocalInfo, Config, Manifest};
+            case Overview0 of
+                #{last_tiered_fragment_offset := LTFO, last_tiered_segment_offset := LTSO} ->
+                    create_sparse_segment(Dir, Epoch, LTSO, LTFO),
+                    ok;
+                _ ->
+                    ok
+            end,
+            Manifest = #manifest_writer{type = acceptor},
+            {Manifest, Config};
         _ ->
             exit(replica_local_log_has_data)
-    end.
-
-find_data_reader_position(TailInfo, Config) ->
-    %% Data readers are only used for replication. With tiered storage the only
-    %% point of replication is to ensure durability with minimal latency. Once
-    %% in the remote tier there's no point in replicating the data anymore as
-    %% the remote tier is assumed to be durable.
-    osiris_log:find_data_reader_position(TailInfo, Config).
-
-find_offset_reader_position(first, #{dir := Dir} = Config) ->
-    %% For offset-spec `first` we always need to check the remote tier. Only
-    %% if it is empty can we serve `first` from the local tier.
-    case gen_server:call(?SERVER, {init_reader, Dir}) of
-        undefined ->
-            osiris_log:find_offset_reader_position(first, Config);
-        #manifest{first_offset = FirstOffset} ->
-            %% `first` will always be a segment boundary. So we can figure out
-            %% the first offset directly. It's the first chunk.
-            Pos = ?LOG_HEADER_SIZE,
-            File = filename:join(Dir, make_file_name(FirstOffset, "segment")),
-            ?LOG_DEBUG(
-                "Attaching to remote tier at offset ~b (byte ~b) for spec 'first' in ~ts",
-                [FirstOffset, Pos, File]
-            ),
-            {ok, FirstOffset, Pos, File}
-    end;
-find_offset_reader_position(Offset, #{dir := Dir} = Config) when is_integer(Offset) ->
-    ?LOG_DEBUG(?MODULE_STRING ":~ts/2 finding offset ~b", [?FUNCTION_NAME, Offset]),
-    case osiris_log:find_offset_reader_position({abs, Offset}, Config) of
-        {ok, _, _, _} = FoundLocally ->
-            FoundLocally;
-        {error, {offset_out_of_range, {_First, LastLocalOffset}}} when Offset > LastLocalOffset ->
-            ?LOG_DEBUG("requested offset ~b is higher than last local offset ~b", [
-                Offset, LastLocalOffset
-            ]),
-            %% TODO: try the remote tier? Or just attach to next?
-            exit({todo, offset_find_higher_than_local_tier});
-        {error, {offset_out_of_range, Range}} ->
-            ?LOG_DEBUG("offset ~b is not local (local range ~w), trying the remote tier", [
-                Offset, Range
-            ]),
-            case gen_server:call(?SERVER, {init_reader, Dir}) of
-                undefined ->
-                    %% TODO: No stream? Just attach to next? I guess?
-                    osiris_log:find_offset_reader_position(next, Config);
-                #manifest{first_offset = FirstOffset} when Offset < FirstOffset ->
-                    %% NOTE: emulates osiris's offset behavior.
-                    %% `first` will always be a segment boundary. So we can figure out
-                    %% the first offset directly. It's the first chunk.
-                    Pos = ?LOG_HEADER_SIZE,
-                    File = filename:join(Dir, make_file_name(FirstOffset, "segment")),
-                    ?LOG_DEBUG(
-                        "Attaching to remote tier at offset ~b (byte ~b) for spec ~b in ~ts",
-                        [FirstOffset, Pos, Offset, File]
-                    ),
-                    {ok, FirstOffset, Pos, File};
-                #manifest{entries = Entries} ->
-                    rabbitmq_stream_s3_log_manifest_search:position(Dir, Offset, Entries)
-            end;
-        {error, _} = Err ->
-            Err
-    end;
-find_offset_reader_position(OffsetSpec, Config) ->
-    ?LOG_DEBUG("~ts with offset spec ~w", [?FUNCTION_NAME, OffsetSpec]),
-    %% TODO: support all offset specs. For some offset specs we might be able
-    %% to skip reading the manifest (i.e. tail reads).
-    case osiris_log:find_offset_reader_position(OffsetSpec, Config) of
-        {ok, _, _, _} = FoundLocally ->
-            FoundLocally;
-        {error, _} = Err ->
-            ?LOG_DEBUG("~ts error: ~w", [?FUNCTION_NAME, Err]),
-            Err
     end.
 
 close_manifest(#manifest_writer{}) ->
@@ -566,6 +391,9 @@ close_manifest(#manifest_writer{}) ->
 delete(_Config) ->
     %% TODO use the `dir` from config to delete the remote manifest and
     %% fragments.
+    %% TODO the stream coordinator deletes individual replicas rather than
+    %% issuing any "delete the whole stream," so we need to recognize when
+    %% membership falls to zero in order to clean up from the remote tier.
     ok.
 
 %%---------------------------------------------------------------------------
@@ -574,23 +402,6 @@ start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 init([]) ->
-    ok = application:ensure_started(rabbitmq_aws),
-    %% {ok, AccessKey} = application:get_env(rabbitmq_stream_s3, aws_access_key),
-    %% {ok, SecretKey} = application:get_env(rabbitmq_stream_s3, aws_secret_key),
-    %% {ok, Region} = application:get_env(rabbitmq_stream_s3, aws_region),
-    %% ok = rabbitmq_aws:set_credentials(AccessKey, SecretKey),
-    %% ok = rabbitmq_aws:set_region(Region),
-
-    %% TODO: temporary while we test larger segments.
-    application:set_env(
-        osiris,
-        max_segment_size_chunks,
-        %% 256_000 by default
-
-        %% 2^20
-        1_048_576
-    ),
-
     {ok, #?MODULE{}}.
 
 handle_call(
@@ -605,7 +416,7 @@ handle_call(
         }
     },
     async_get_manifest(Dir, From, State);
-handle_call({init_reader, Dir}, From, State) ->
+handle_call({get_manifest, Dir}, From, State) ->
     %% TODO: this is too simplistic. Reading from the root manifest should be
     %% done within the server. And then the server should give a spec to
     %% readers to find anything within branches.
@@ -947,7 +758,7 @@ upload_fragment(
                 {ok, SegData} = file:pread(SegFd, SegmentPos, Size),
                 {ok, IdxData0} = file:pread(
                     IdxFd,
-                    ?IDX_HEADER_SIZE + (IdxStart * ?INDEX_RECORD_SIZE_B),
+                    ?IDX_HEADER_B + (IdxStart * ?INDEX_RECORD_SIZE_B),
                     IdxLen * ?INDEX_RECORD_SIZE_B
                 ),
                 %% Convert from osiris index style to fragment index. We can
@@ -957,7 +768,7 @@ upload_fragment(
                     <<
                         IdxChId:64/unsigned,
                         IdxTs:64/signed,
-                        (SegmentFilePos - SegmentPos + ?LOG_HEADER_SIZE):32/unsigned
+                        (SegmentFilePos - SegmentPos + ?SEGMENT_HEADER_B):32/unsigned
                     >>
                  || <<
                         IdxChId:64/unsigned,
@@ -975,10 +786,10 @@ upload_fragment(
                     Size,
                     IdxStart,
                     SegmentPos,
-                    (?LOG_HEADER_SIZE + Size + ?IDX_HEADER_SIZE),
+                    (?SEGMENT_HEADER_B + Size + ?IDX_HEADER_B),
                     (byte_size(IdxData))
                 ),
-                Data = [?LOG_HEADER, SegData, ?IDX_HEADER, IdxData, Trailer],
+                Data = [?SEGMENT_HEADER, SegData, ?IDX_HEADER, IdxData, Trailer],
                 Checksum =
                     case Checksum0 of
                         undefined ->
@@ -1283,10 +1094,10 @@ create_sparse_segment(Dir, Epoch, LTSO, LTFO) ->
             Handle,
             Bucket,
             StartFragmentKey,
-            {?LOG_HEADER_SIZE, ?LOG_HEADER_SIZE + ?HEADER_SIZE_B}
+            {?SEGMENT_HEADER_B, ?SEGMENT_HEADER_B + ?CHUNK_HEADER_B}
         ),
         ?LOG_DEBUG("Writing segment header with first chunk ~w", [FirstChunkHeader]),
-        ok = file:write(SegFd, [?LOG_HEADER, FirstChunkHeader]),
+        ok = file:write(SegFd, [?SEGMENT_HEADER, FirstChunkHeader]),
 
         {ok, TrailingFragmentData} = rabbitmq_stream_s3_api:get_object_with_range(
             Handle,
@@ -1299,7 +1110,6 @@ create_sparse_segment(Dir, Epoch, LTSO, LTFO) ->
             TrailingFragmentData,
         #fragment_info{
             segment_start_pos = SegmentStartPos,
-            next_offset = NextOffset,
             num_chunks_in_segment = NumChunksInSegment,
             size = FragmentDataSize,
             index_size = IdxSize
@@ -1313,7 +1123,7 @@ create_sparse_segment(Dir, Epoch, LTSO, LTFO) ->
         %% * Third: we need the last index record at the correct position.
         NumChunksInFragment = (IdxSize div ?INDEX_RECORD_B),
         LastIdxRecordPos =
-            ?IDX_HEADER_SIZE +
+            ?IDX_HEADER_B +
                 %% `-1` because we're writing the last index record.
                 ?INDEX_RECORD_SIZE_B * (NumChunksInSegment + NumChunksInFragment - 1),
         ?LOG_DEBUG("Moving idx fd to ~w", [LastIdxRecordPos]),
@@ -1336,13 +1146,12 @@ create_sparse_segment(Dir, Epoch, LTSO, LTFO) ->
             Handle,
             Bucket,
             LastFragmentKey,
-            {FragmentFilePos, FragmentDataSize + ?LOG_HEADER_SIZE}
+            {FragmentFilePos, FragmentDataSize + ?SEGMENT_HEADER_B}
         ),
         ?LOG_DEBUG("Read ~b bytes (~b - ~b) of last chunk data: ~W", [
             byte_size(LastChunkData), FragmentFilePos, FragmentDataSize, LastChunkData, 10
         ]),
-        ok = file:write(SegFd, LastChunkData),
-        NextOffset
+        ok = file:write(SegFd, LastChunkData)
     after
         ok = rabbitmq_aws:close_connection(Handle),
         ok = file:close(SegFd),

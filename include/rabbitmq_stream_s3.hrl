@@ -1,6 +1,35 @@
 %% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 %% SPDX-License-Identifier: Apache-2.0
 
+%% Segment and fragment file header size. 4 bytes for the magic and 4 bytes for
+%% the version.
+-define(SEGMENT_HEADER_B, 8).
+-define(SEGMENT_VERSION, 1).
+-define(SEGMENT_HEADER, <<"OSIL", ?SEGMENT_VERSION:32/unsigned>>).
+-define(IDX_HEADER_B, 8).
+-define(IDX_VERSION, 1).
+-define(IDX_HEADER, ?IDX_HEADER(<<>>)).
+-define(IDX_HEADER(Rem), <<"OSII", ?IDX_VERSION:32/unsigned, Rem/binary>>).
+-define(INDEX_RECORD_SIZE_B, 29).
+
+-define(CHUNK_HEADER_B, 48).
+-define(MAX_FILTER_SIZE, 255).
+-define(CHNK_USER, 0).
+-define(CHNK_TRK_DELTA, 1).
+-define(CHNK_TRK_SNAPSHOT, 2).
+-define(REC_MATCH_SIMPLE(Len, Rem),
+    <<0:1, Len:31/unsigned, Rem/binary>>
+).
+-define(REC_MATCH_SUBBATCH(CompType, NumRec, UncompLen, Len, Rem), <<
+    1:1,
+    CompType:3/unsigned,
+    _:4/unsigned,
+    NumRecs:16/unsigned,
+    UncompressedLen:32/unsigned,
+    Len:32/unsigned,
+    Rem/binary
+>>).
+
 %% The index which is concatenated in with segment files.
 -define(REMOTE_IDX_VERSION, 1).
 -define(REMOTE_IDX_MAGIC, "OSII").
@@ -102,6 +131,13 @@
     Rest/binary
 >>).
 
+-record(manifest, {
+    first_offset :: osiris:offset(),
+    first_timestamp :: osiris:timestamp(),
+    total_size :: non_neg_integer(),
+    entries :: binary()
+}).
+
 %% offset (8) + timestamp (8) + kind/size (9) + seq no (2) = 27
 -define(ENTRY_B, 27).
 %% Number of outgoing edges from this branch. Works for the entries array of
@@ -118,3 +154,5 @@
 %% -define(MAX_SEGMENT_SIZE_BYTES, 1_073_741_824).
 %% 1/G GiB (2^29 B)
 -define(MAX_SEGMENT_SIZE_BYTES, 536_870_912).
+
+-type byte_offset() :: non_neg_integer().

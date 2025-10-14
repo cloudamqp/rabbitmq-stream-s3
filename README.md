@@ -11,12 +11,12 @@ rabbitmq-stream-s3 is not stable, with frequent changes in design and functional
 This project currently requires specific development branches of the `rabbitmq-server` and `osiris` repositories:
 
 ### rabbitmq-server
-Branch: `aws/streams-tiered-storage-dev`
+Branch: [`streams-tiered-storage`](https://github.com/amazon-mq/upstream-to-rabbitmq-server/tree/streams-tiered-storage)
 
 Contains changes needed for S3 integration.
 
 ### osiris
-Branch: `md/log-reader-and-manifest`
+Branch: [`tiered-storage-abstractions`](https://github.com/amazon-mq/upstream-to-osiris/tree/tiered-storage-abstractions)
 
 Contains the abstraction layer in Osiris. See [Tiered Storage Support for RabbitMQ Streams](https://github.com/rabbitmq/osiris/issues/184)
 
@@ -24,18 +24,18 @@ Contains the abstraction layer in Osiris. See [Tiered Storage Support for Rabbit
 
 1. **Clone the RabbitMQ server repository**
 ```
-git clone https://github.com/rabbitmq/rabbitmq-server.git
+git clone https://github.com/amazon-mq/upstream-to-rabbitmq-server.git
 cd rabbitmq-server
 ```
 2. **Switch to the required branch**
 ```
-git checkout aws/streams-tiered-storage-dev
+git checkout streams-tiered-storage
 ```
 3. **Build with the stream-s3 plugin with the correct osiris branch**
 ```
 ADDITIONAL_PLUGINS=rabbitmq_stream_s3 \
 dep_rabbitmq_stream_s3="git git@github.com:amazon-mq/rabbitmq-stream-s3.git main" \
-dep_osiris="git https://github.com/rabbitmq/osiris md/log-reader-and-manifest" \
+dep_osiris="git https://github.com/amazon-mq/upstream-to-osiris tiered-storage-abstractions" \
 make
 ```
 
