@@ -1,0 +1,26 @@
+name: erlfmt
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  format-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: 27
+          rebar3-version: 3.22
+      - run: |
+          git clone --branch v1.7.0 https://github.com/WhatsApp/erlfmt.git ${{ github.workspace }}/erlfmt
+          cd ${{ github.workspace }}/erlfmt && rebar3 as release escriptize
+      - name: Run erlfmt check
+        run: ${{ github.workspace }}/erlfmt/_build/release/bin/erlfmt -c

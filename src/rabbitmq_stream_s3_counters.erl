@@ -23,21 +23,17 @@
 -define(INDEX_BYTES_WRITTEN, 8).
 
 -define(LOG_MANIFEST_COUNTERS, [
-    {manifests_read, ?MANIFESTS_READ, counter,
-        "Number of (non-empty) manifests read"},
+    {manifests_read, ?MANIFESTS_READ, counter, "Number of (non-empty) manifests read"},
     {manifest_bytes_read, ?MANIFEST_BYTES_READ, counter,
         "Number of manifest file bytes read from S3"},
-    {manifests_written, ?MANIFESTS_WRITTEN, counter,
-        "Number of manifests written to S3"},
+    {manifests_written, ?MANIFESTS_WRITTEN, counter, "Number of manifests written to S3"},
     {manifest_bytes_written, ?MANIFEST_BYTES_WRITTEN, counter,
         "Number of bytes of manifest files written to S3"},
     %% TODO will rename to "fragment" (maybe keep the segment ones too though).
-    {uploaded_segments, ?SEGMENTS_WRITTEN, counter,
-        "Number of segment files uploaded to S3"},
+    {uploaded_segments, ?SEGMENTS_WRITTEN, counter, "Number of segment files uploaded to S3"},
     {uploaded_segment_bytes, ?SEGMENT_BYTES_WRITTEN, counter,
         "Number of bytes of segment files written to S3"},
-    {uploaded_indexes, ?INDEXES_WRITTEN, counter,
-        "Number of index files uploaded to S3"},
+    {uploaded_indexes, ?INDEXES_WRITTEN, counter, "Number of index files uploaded to S3"},
     {uploaded_index_bytes, ?INDEX_BYTES_WRITTEN, counter,
         "Number of bytes of index files written to S3"}
 ]).
