@@ -1,0 +1,34 @@
+name: Build-RMQ
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 1' # Runs weekly on Monday 00:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  build-cache-rabbitmq-server:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rmq-version: ['streams-tiered-storage']
+        include:
+          - rmq-version: 'streams-tiered-storage'
+            otp-version: 27
+            elixir-version: 1.18
+    steps:
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp-version }}
+          elixir-version: ${{ matrix.elixir-version }}
+      - id: clone-rabbitmq-server
+        run: |
+          git clone --branch ${{ matrix.rmq-version }} https://github.com/amazon-mq/upstream-to-rabbitmq-server.git ${{ github.workspace }}/rabbitmq-server
+      - id: build-rabbitmq-server
+        run: make -C ${{ github.workspace }}/rabbitmq-server
+      - uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/rabbitmq-server
+          key: rmq-${{ matrix.rmq-version }}-otp-${{ matrix.otp-version }}-elixir-${{ matrix.elixir-version }}
