@@ -451,7 +451,7 @@ read_header2(
     } = Remote0,
     HeaderBin
 ) ->
-    <<HeaderBin1:?CHUNK_HEADER_B/binary, _/binary>> = HeaderBin, 
+    <<HeaderBin1:?CHUNK_HEADER_B/binary, _/binary>> = HeaderBin,
     {ok, Header} = osiris_log:parse_header(HeaderBin1, Position0),
     #{
         type := ChunkType,
@@ -552,7 +552,9 @@ init_remote_reader(
             Err
     end.
 
-convert_remote_to_local(#?MODULE{config = Config, mode = #remote{pid = Pid, next_offset = NextOffset}}) ->
+convert_remote_to_local(#?MODULE{
+    config = Config, mode = #remote{pid = Pid, next_offset = NextOffset}
+}) ->
     ?LOG_DEBUG("Converting to local reader at offset ~b", [NextOffset]),
     ok = gen_server:cast(Pid, close),
     init_local_reader(first, Config).
