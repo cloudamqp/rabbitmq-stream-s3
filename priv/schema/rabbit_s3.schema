@@ -1,5 +1,7 @@
 %% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 %% SPDX-License-Identifier: Apache-2.0
+%% vim:ft=erlang:
+%% -*- mode: erlang; -*-
 
 {mapping, "s3.region", "rabbitmq_stream_s3.aws_region", [
     {datatype, string}
