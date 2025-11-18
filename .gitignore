@@ -15,4 +15,4 @@
 /sbin.lock
 /xrefr
 
-rabbitmq_aws_s3.d
+rabbitmq_stream_s3.d
