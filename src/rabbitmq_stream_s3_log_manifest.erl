@@ -242,7 +242,7 @@ checksum(Checksum, Data) ->
     erlang:crc32(Checksum, Data).
 
 writer_manifest(#{dir := Dir, reference := Ref} = Config0) ->
-    Config = Config0#{max_segment_size_bytes := ?MAX_SEGMENT_SIZE_BYTES},
+    Config = Config0#{max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES},
     Remote = gen_server:call(?SERVER, {init_writer, Ref, Dir}),
     ?LOG_DEBUG("Recovering manifest for stream ~ts", [Dir]),
     Fragment = recover_manifest(Dir, Ref, Remote),
@@ -368,7 +368,7 @@ recover_tracking(Trk0, SegmentFile, #manifest_writer{}) ->
 
 acceptor_manifest(Overview0, #{dir := Dir, epoch := Epoch} = Config0) ->
     ?LOG_DEBUG("acceptor got remote overview: ~w", [Overview0]),
-    Config = Config0#{max_segment_size_bytes := ?MAX_SEGMENT_SIZE_BYTES},
+    Config = Config0#{max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES},
     case list_dir(Dir) of
         [] ->
             case Overview0 of
