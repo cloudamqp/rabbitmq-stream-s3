@@ -130,12 +130,7 @@
 start() ->
     {ok, _} = application:ensure_all_started(rabbitmq_aws),
 
-    %% TODO: only set these when they are configured.
-    {ok, AccessKey} = application:get_env(rabbitmq_stream_s3, aws_access_key),
-    {ok, SecretKey} = application:get_env(rabbitmq_stream_s3, aws_secret_key),
-    {ok, Region} = application:get_env(rabbitmq_stream_s3, aws_region),
-    ok = rabbitmq_aws:set_credentials(AccessKey, SecretKey),
-    ok = rabbitmq_aws:set_region(Region),
+    ok = setup_credentials_and_region(),
 
     ok = rabbitmq_stream_s3_counters:init(),
     rabbit_sup:start_child(?MODULE).
@@ -1165,3 +1160,18 @@ list_dir(Dir) ->
         {ok, Files} ->
             [list_to_binary(F) || F <- Files]
     end.
+
+setup_credentials_and_region() ->
+    AccessKey = application:get_env(rabbitmq_stream_s3, aws_access_key, undefined),
+    SecretKey = application:get_env(rabbitmq_stream_s3, aws_secret_key, undefined),
+    Region = application:get_env(rabbitmq_stream_s3, aws_region, undefined),
+
+    ok = maybe_setup_credentials(AccessKey, SecretKey),
+    ok = maybe_setup_region(Region).
+
+maybe_setup_credentials(undefined, _) -> ok;
+maybe_setup_credentials(_, undefined) -> ok;
+maybe_setup_credentials(AccessKey, SecretKey) -> rabbitmq_aws:set_credentials(AccessKey, SecretKey).
+
+maybe_setup_region(undefined) -> ok;
+maybe_setup_region(Region) -> rabbitmq_aws:set_region(Region).
