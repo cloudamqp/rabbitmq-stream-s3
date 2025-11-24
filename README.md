@@ -31,11 +31,8 @@ cd rabbitmq-server
 ```
 git checkout streams-tiered-storage
 ```
-3. **Build with the stream-s3 plugin with the correct osiris branch**
+3. **This build will include the stream-s3 plugin and the correct osiris branch so just build!**
 ```
-ADDITIONAL_PLUGINS=rabbitmq_stream_s3 \
-dep_rabbitmq_stream_s3="git git@github.com:amazon-mq/rabbitmq-stream-s3.git main" \
-dep_osiris="git https://github.com/amazon-mq/upstream-to-osiris tiered-storage-abstractions" \
 make
 ```
 
