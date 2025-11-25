@@ -53,8 +53,9 @@
     uploaded_fragments = [] :: [#fragment_info{}],
     %% The next offset that should be uploaded.
     %% All offsets under this have been tiered without any "holes" in the
-    %% remote log.
-    next_tiered_offset :: osiris:offset() | undefined
+    %% remote log. TODO: is zero the correct default here? What if the entire
+    %% local log is truncated away?
+    next_tiered_offset = 0 :: osiris:offset()
 }).
 
 -record(manifest_writer, {
@@ -570,6 +571,9 @@ handle_cast(
             %% linear time.
             Uploaded1 = sort_infos([Info | Uploaded0]),
             {NTO, Pending, Finished} = split_uploaded_infos(NTO0, Uploaded1, []),
+            ?LOG_DEBUG("~b finished uploads, ~b pending, nto ~p -> ~p", [
+                length(Finished), length(Pending), NTO0, NTO
+            ]),
             #{Dir := {Manifest0, UploadStatus0}} = Manifests0,
             {Manifest, UploadStatus, Tasks} = apply_infos(
                 Finished, Manifest0, UploadStatus0, Tasks2, Dir
@@ -700,9 +704,7 @@ split_uploaded_infos(
     NextTieredOffset,
     [#fragment_info{offset = FirstOffset, next_offset = NextOffset} = Info | Rest],
     Acc
-) when
-    NextTieredOffset =:= undefined orelse FirstOffset =:= NextTieredOffset
-->
+) when NextTieredOffset =:= FirstOffset ->
     split_uploaded_infos(NextOffset, Rest, [Info | Acc]);
 split_uploaded_infos(NextTieredOffset, PendingUploaded, Acc) ->
     {NextTieredOffset, PendingUploaded, lists:reverse(Acc)}.
