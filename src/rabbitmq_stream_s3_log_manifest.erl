@@ -16,48 +16,6 @@
 -behaviour(osiris_log_manifest).
 -behaviour(gen_server).
 
--define(SEGMENT_HEADER_HASH, erlang:crc32(?SEGMENT_HEADER)).
-
--record(fragment, {
-    segment_offset :: osiris:offset(),
-    segment_pos = ?SEGMENT_HEADER_B :: pos_integer(),
-    %% Number of chunks in prior fragments and number in current fragment.
-    num_chunks = {0, 0} :: {non_neg_integer(), non_neg_integer()},
-    first_offset :: osiris:offset() | undefined,
-    first_timestamp :: osiris:timestamp() | undefined,
-    last_offset :: osiris:offset() | undefined,
-    next_offset :: osiris:offset() | undefined,
-    %% Zero-based increasing integer for sequence number within the segment.
-    seq_no = 0 :: non_neg_integer(),
-    %% NOTE: header size is not included.
-    size = 0 :: non_neg_integer(),
-    %% TODO: do checksum during upload if undefined.
-    checksum = ?SEGMENT_HEADER_HASH :: checksum() | undefined
-}).
-
--record(writer, {
-    %% Pid of the osiris_writer process. Used to attach offset listeners.
-    pid :: pid(),
-    %% Local dir of the log.
-    dir :: file:filename_all(),
-    %% Current commit offset (updated by offset listener notifications) known
-    %% to the manifest - this can lag behind the actual commit offset.
-    commit_offset = -1 :: osiris:offset(),
-    %% List of segments in ascending offset order which have been rolled and
-    %% are awaiting upload.
-    uncommitted_fragments = [] :: [#fragment{}],
-    %% Fragments which are currently being uploaded and their monitor ref.
-    uploading_fragments = #{} :: #{osiris:offset() => reference()},
-    %% List of fragments in ascending offset order which have been uploaded
-    %% successfully but have not yet been applied to the manifest.
-    uploaded_fragments = [] :: [#fragment_info{}],
-    %% The next offset that should be uploaded.
-    %% All offsets under this have been tiered without any "holes" in the
-    %% remote log. TODO: is zero the correct default here? What if the entire
-    %% local log is truncated away?
-    next_tiered_offset = 0 :: osiris:offset()
-}).
-
 -record(manifest_writer, {
     type :: writer | acceptor,
     %% Only defined for writers:
@@ -65,25 +23,16 @@
     fragment :: #fragment{} | undefined
 }).
 
-%% NOTE: Pending is reversed.
--type upload_status() :: {uploading, Pending :: [#fragment{}]} | {last_uploaded, non_neg_integer()}.
-
 -record(?MODULE, {
-    writers = #{} :: #{writer_ref() => #writer{}},
-    manifests = #{} :: #{
-        file:filename_all() =>
-            {#manifest{}, upload_status()} | undefined | {pending, reference(), [gen_server:from()]}
-    },
-    tasks = #{} :: #{reference() => task()}
+    machine = rabbitmq_stream_s3_log_manifest_machine:new() :: rabbitmq_stream_s3_log_manifest_machine:state(),
+    tasks = #{} :: #{pid() => effect()}
 }).
 
-%% Set by `rabbit_stream_queue:make_stream_conf/1'.
--type writer_ref() :: rabbit_amqqueue:name().
-
--type task() ::
-    {manifest, file:filename_all()} | {fragment, writer_ref(), #fragment{}}.
-
--type checksum() :: non_neg_integer().
+%% records for the gen_server to handle:
+-record(init_writer, {writer_ref :: writer_ref(), dir :: file:filename_all()}).
+-record(get_manifest, {dir :: file:filename_all()}).
+-record(acceptor_overview, {dir :: file:filename_all()}).
+-record(task_completed, {task_pid :: pid(), event :: event()}).
 
 %% osiris_log_manifest
 -export([
@@ -107,7 +56,8 @@
     code_change/3
 ]).
 
--export([start/0, format_osiris_event/1]).
+%% Need to be exported for `erlang:apply/3`.
+-export([start/0, format_osiris_event/1, execute_task/2]).
 
 -export([get_manifest/1]).
 
@@ -138,7 +88,7 @@ start() ->
 
 -spec get_manifest(file:filename_all()) -> #manifest{} | undefined.
 get_manifest(Dir) ->
-    gen_server:call(?SERVER, {get_manifest, Dir}, infinity).
+    gen_server:call(?SERVER, #get_manifest{dir = Dir}, infinity).
 
 %%----------------------------------------------------------------------------
 
@@ -168,7 +118,7 @@ handle_event(
                     _ ->
                         ok = gen_server:cast(
                             ?SERVER,
-                            {fragment, WriterRef, Fragment0}
+                            #fragment_available{writer_ref = WriterRef, fragment = Fragment0}
                         )
                 end,
                 #fragment{segment_offset = segment_file_offset(NewSegment)}
@@ -217,7 +167,10 @@ handle_event(
             true ->
                 ?assertNotEqual(undefined, Fragment2#fragment.first_offset),
                 %% Roll over the fragment.
-                ok = gen_server:cast(?SERVER, {fragment, WriterRef, Fragment2}),
+                ok = gen_server:cast(
+                    ?SERVER,
+                    #fragment_available{writer_ref = WriterRef, fragment = Fragment2}
+                ),
                 #fragment{
                     segment_offset = SegmentOffset,
                     segment_pos = SegmentPos0 + Size,
@@ -239,7 +192,7 @@ checksum(Checksum, Data) ->
 
 writer_manifest(#{dir := Dir, reference := Ref} = Config0) ->
     Config = Config0#{max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES},
-    Remote = gen_server:call(?SERVER, {init_writer, Ref, Dir}),
+    Remote = gen_server:call(?SERVER, #init_writer{writer_ref = Ref, dir = Dir}),
     ?LOG_DEBUG("Recovering manifest for stream ~ts", [Dir]),
     Fragment = recover_manifest(Dir, Ref, Remote),
     Manifest = #manifest_writer{
@@ -348,7 +301,7 @@ overview(Dir) ->
             LocalOverview;
         #{range := {LocalFrom, LocalTo}} ->
             ?LOG_DEBUG("local range ~w", [{LocalFrom, LocalTo}]),
-            Info = gen_server:call(?SERVER, {acceptor_overview, Dir}, infinity),
+            Info = gen_server:call(?SERVER, #acceptor_overview{dir = Dir}, infinity),
             maps:merge(LocalOverview, Info)
     end.
 
@@ -400,257 +353,49 @@ start_link() ->
 init([]) ->
     {ok, #?MODULE{}}.
 
-handle_call(
-    {init_writer, WriterRef, Dir},
-    {Pid, _Tag} = From,
-    #?MODULE{writers = Writers0} = State0
-) ->
-    ok = register_offset_listener(Pid, -1),
-    State = State0#?MODULE{
-        writers = Writers0#{
-            WriterRef => #writer{pid = Pid, dir = Dir}
-        }
-    },
-    async_get_manifest(Dir, From, State);
-handle_call({get_manifest, Dir}, From, State) ->
+handle_call(#init_writer{writer_ref = WriterRef, dir = Dir}, {Pid, Tag}, State) ->
+    Event = #writer_spawned{pid = Pid, reply_tag = Tag, writer_ref = WriterRef, dir = Dir},
+    evolve_event(Event, State);
+handle_call(#get_manifest{dir = Dir}, From, State) ->
     %% TODO: this is too simplistic. Reading from the root manifest should be
     %% done within the server. And then the server should give a spec to
     %% readers to find anything within branches.
-    async_get_manifest(Dir, From, State);
-handle_call({acceptor_overview, Dir}, _From, #?MODULE{manifests = Manifests} = State) ->
-    Overview =
-        case Manifests of
-            #{Dir := {Manifest, _}} ->
-                acceptor_overview(Manifest);
-            _ ->
-                #{}
-        end,
-    {reply, Overview, State};
-handle_call(Request, _From, State) ->
-    {stop, {unhandled_call, Request}, State}.
-
-async_get_manifest(
-    Dir, ReplyTo, #?MODULE{manifests = Manifests0, tasks = Tasks0} = State0
-) ->
-    case Manifests0 of
-        #{Dir := {pending, Task, Replies0}} ->
-            %% The manifest is being downloaded. Add this process to
-            %% the set of waiting callers.
-            Manifests = Manifests0#{
-                Dir := {pending, Task, [ReplyTo | Replies0]}
-            },
-            State = State0#?MODULE{manifests = Manifests},
-            {noreply, State};
-        #{Dir := {#manifest{} = Manifest, _UploadStatus}} ->
-            %% The manifest was already downloaded. Use the cached
-            %% value.
-            {reply, Manifest, State0};
-        _ ->
-            %% Otherwise kick off a task for the download.
-            {_Pid, MRef} = spawn_monitor(fun() ->
-                download_manifest(Dir)
-            end),
-            Manifests = Manifests0#{Dir => {pending, MRef, [ReplyTo]}},
-            State = State0#?MODULE{
-                manifests = Manifests,
-                tasks = Tasks0#{MRef => {manifest, Dir}}
-            },
-            {noreply, State}
-    end.
+    Event = #manifest_requested{dir = Dir, requester = From},
+    evolve_event(Event, State);
+handle_call(#acceptor_overview{dir = Dir}, _From, #?MODULE{machine = MacState} = State) ->
+    Manifest = rabbitmq_stream_s3_log_manifest_machine:get_manifest(Dir, MacState),
+    {reply, acceptor_overview(Manifest), State};
+handle_call(Request, From, State) ->
+    ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
+    {noreply, State}.
 
 handle_cast(
-    {manifest, Dir, Manifest},
-    #?MODULE{manifests = Manifests0, tasks = Tasks0} = State0
+    #task_completed{task_pid = TaskPid, event = Event},
+    #?MODULE{tasks = Tasks0} = State0
 ) ->
-    case Manifests0 of
-        #{Dir := {pending, MRef, Replies}} ->
-            true = erlang:demonitor(MRef),
-            lists:foreach(
-                fun(Caller) ->
-                    gen_server:reply(Caller, Manifest)
-                end,
-                Replies
-            ),
-            UploadStatus = {last_uploaded, 0},
-            State = State0#?MODULE{
-                manifests = Manifests0#{Dir := {Manifest, UploadStatus}},
-                tasks = maps:remove(MRef, Tasks0)
-            },
-            {noreply, State};
-        _ ->
-            {noreply, State0}
-    end;
-handle_cast(
-    {rebalanced_manifest, Dir, Manifest0},
-    #?MODULE{manifests = Manifests0, tasks = Tasks0} = State0
-) ->
-    case Manifests0 of
-        #{Dir := {_Manifest0, UploadStatus0}} ->
-            %% assertion
-            {uploading, Pending0} = UploadStatus0,
-            %% Pending is stored reversed for quick prepends.
-            Pending = lists:reverse(Pending0),
-            %% Force an update of the manifest when rebalancing.
-            UploadStatus1 = {last_uploaded, infinity},
-            {Manifest, UploadStatus, Tasks} =
-                apply_infos(Pending, Manifest0, UploadStatus1, Tasks0, Dir),
-            State = State0#?MODULE{
-                manifests = Manifests0#{Dir := {Manifest, UploadStatus}},
-                tasks = Tasks
-            },
-            {noreply, State};
-        _ ->
-            ?LOG_ERROR("This shouldn't happen (rebalancing)! ~p ~w", [Dir, Manifest0]),
-            {noreply, State0}
-    end;
-handle_cast(
-    {manifest_uploaded, Dir},
-    #?MODULE{manifests = Manifests0, tasks = Tasks0} = State0
-) ->
-    case Manifests0 of
-        #{Dir := {Manifest0, UploadStatus0}} ->
-            %% assertion
-            {uploading, Pending0} = UploadStatus0,
-            %% Pending is stored reversed for quick prepends.
-            Pending = lists:reverse(Pending0),
-            {Manifest, UploadStatus, Tasks} =
-                apply_infos(Pending, Manifest0, {last_uploaded, 0}, Tasks0, Dir),
-            State = State0#?MODULE{
-                manifests = Manifests0#{Dir := {Manifest, UploadStatus}},
-                tasks = Tasks
-            },
-            {noreply, State};
-        _ ->
-            ?LOG_ERROR("This shouldn't happen (after upload)! ~p", [Dir]),
-            {noreply, State0}
-    end;
-handle_cast(
-    {fragment, WriterRef, Fragment},
-    #?MODULE{writers = Writers0} = State0
-) ->
-    case Writers0 of
-        #{WriterRef := #writer{uncommitted_fragments = Fragments0} = Writer0} ->
-            Fragments = [Fragment | Fragments0],
-            Writer = Writer0#writer{uncommitted_fragments = Fragments},
-            State = State0#?MODULE{writers = Writers0#{WriterRef := Writer}},
-            {noreply, State};
-        _ ->
-            {noreply, State0}
-    end;
-handle_cast(
-    {fragment_uploaded, WriterRef, #fragment_info{offset = Offset} = Info},
-    #?MODULE{writers = Writers0, manifests = Manifests0, tasks = Tasks0} = State0
-) ->
-    case Writers0 of
-        #{
-            WriterRef := #writer{
-                dir = Dir,
-                uploading_fragments = Uploading0,
-                uploaded_fragments = Uploaded0,
-                next_tiered_offset = NTO0
-            } = Writer0
-        } ->
-            %% The fragment might've been uploaded by an old incarnation of
-            %% the writer before shutting down, so we might not have the
-            %% fragment in state here.
-            {Tasks2, Uploading} =
-                case Uploading0 of
-                    #{Offset := MRef} ->
-                        true = erlang:demonitor(MRef),
-                        Tasks1 = maps:remove(MRef, Tasks0),
-                        Uploading1 = maps:remove(Offset, Uploading0),
-                        {Tasks1, Uploading1};
-                    _ ->
-                        {Tasks0, Uploading0}
-                end,
-            %% Fragments could possibly be uploaded out of order. Only add the
-            %% uploaded fragments to the manifest once there are no "holes"
-            %% remaining in the sequence of fragments.
-            %% TODO: this list is always sorted and is built one fragment at a
-            %% time. Write a little helper to insert at the right position in
-            %% linear time.
-            Uploaded1 = sort_infos([Info | Uploaded0]),
-            {NTO, Pending, Finished} = split_uploaded_infos(NTO0, Uploaded1, []),
-            ?LOG_DEBUG("~b finished uploads, ~b pending, nto ~p -> ~p", [
-                length(Finished), length(Pending), NTO0, NTO
-            ]),
-            #{Dir := {Manifest0, UploadStatus0}} = Manifests0,
-            {Manifest, UploadStatus, Tasks} = apply_infos(
-                Finished, Manifest0, UploadStatus0, Tasks2, Dir
-            ),
-            Writer = Writer0#writer{
-                uploading_fragments = Uploading,
-                uploaded_fragments = Pending,
-                next_tiered_offset = NTO
-            },
-            State = State0#?MODULE{
-                writers = Writers0#{WriterRef := Writer},
-                manifests = Manifests0#{Dir := {Manifest, UploadStatus}},
-                tasks = Tasks
-            },
-            {noreply, State};
-        _ ->
-            {noreply, State0}
-    end;
+    %% assertion
+    #{TaskPid := _Effect} = Tasks0,
+    Tasks = maps:remove(TaskPid, Tasks0),
+    evolve_event(Event, State0#?MODULE{tasks = Tasks});
+handle_cast(#fragment_available{} = Event, State) ->
+    evolve_event(Event, State);
 handle_cast(Message, State) ->
     ?LOG_DEBUG(?MODULE_STRING " received unexpected cast: ~W", [Message, 10]),
     {noreply, State}.
 
-handle_info(
-    {osiris_offset, WriterRef, CommitOffset},
-    #?MODULE{writers = Writers0, tasks = Tasks0} = State0
-) ->
-    case Writers0 of
-        #{
-            WriterRef := #writer{
-                pid = Pid,
-                dir = Dir,
-                uncommitted_fragments = Uncommitted0,
-                uploading_fragments = Uploading0
-            } = Writer0
-        } ->
-            {Committed, Uncommitted} = lists:splitwith(
-                fun(#fragment{last_offset = LastOffset}) ->
-                    LastOffset < CommitOffset
-                end,
-                Uncommitted0
-            ),
-            {Uploading, Tasks} = lists:foldl(
-                fun(#fragment{first_offset = Offset} = Fragment, {Uploading1, Tasks1}) ->
-                    {_Pid, MRef} = spawn_monitor(fun() ->
-                        upload_fragment(WriterRef, Dir, Fragment)
-                    end),
-                    Uploading2 = Uploading1#{Offset => MRef},
-                    Tasks2 = Tasks1#{MRef => {fragment, WriterRef, Fragment}},
-                    {Uploading2, Tasks2}
-                end,
-                {Uploading0, Tasks0},
-                Committed
-            ),
-
-            ok = register_offset_listener(Pid, CommitOffset + 1),
-            Writer = Writer0#writer{
-                commit_offset = CommitOffset,
-                uncommitted_fragments = Uncommitted,
-                uploading_fragments = Uploading
-            },
-            Writers = Writers0#{WriterRef := Writer},
-            State = State0#?MODULE{writers = Writers, tasks = Tasks},
-            {noreply, State};
-        _ ->
-            {noreply, State0}
-    end;
-handle_info({'DOWN', MRef, process, Pid, Reason}, #?MODULE{tasks = Tasks0} = State0) ->
-    State = State0#?MODULE{tasks = maps:remove(MRef, Tasks0)},
-    case Reason of
-        normal ->
-            {noreply, State};
-        _ ->
-            ?LOG_INFO("Task ~w (~w) down with reason ~w. Tasks: ~W", [
-                Pid, MRef, Reason, Tasks0, 10
+handle_info({osiris_offset, WriterRef, Offset}, State) ->
+    Event = #commit_offset_increased{writer_ref = WriterRef, offset = Offset},
+    evolve_event(Event, State);
+handle_info({'DOWN', _MRef, process, Pid, Reason}, #?MODULE{tasks = Tasks0} = State0) ->
+    case maps:take(Pid, Tasks0) of
+        {_Effect, Tasks} ->
+            ?LOG_INFO("Task ~p down with reason ~w. Tasks: ~W", [
+                Pid, Reason, Tasks0, 10
             ]),
-            %% TODO... retry failed tasks?
-            {noreply, State}
+            %% TODO: retry. We have the effect and can attempt it again.
+            {noreply, State0#?MODULE{tasks = Tasks}};
+        error ->
+            {noreply, State0}
     end;
 handle_info(Message, State) ->
     ?LOG_DEBUG(
@@ -666,11 +411,6 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 %%---------------------------------------------------------------------------
-
-register_offset_listener(WriterPid, Offset) ->
-    osiris:register_offset_listener(
-        WriterPid, Offset, {?MODULE, format_osiris_event, []}
-    ).
 
 format_osiris_event(Event) ->
     Event.
@@ -700,39 +440,57 @@ segment_file_offset(File) ->
     <<Digits:20/binary, ".segment">> = iolist_to_binary(filename:basename(File)),
     binary_to_integer(Digits).
 
-split_uploaded_infos(
-    NextTieredOffset,
-    [#fragment_info{offset = FirstOffset, next_offset = NextOffset} = Info | Rest],
-    Acc
-) when NextTieredOffset =:= FirstOffset ->
-    split_uploaded_infos(NextOffset, Rest, [Info | Acc]);
-split_uploaded_infos(NextTieredOffset, PendingUploaded, Acc) ->
-    {NextTieredOffset, PendingUploaded, lists:reverse(Acc)}.
+-spec evolve_event(event(), #?MODULE{}) -> {noreply, #?MODULE{}}.
+evolve_event(Event, #?MODULE{machine = MacState0} = State0) ->
+    {MacState, Effects} = rabbitmq_stream_s3_log_manifest_machine:apply(
+        metadata(), Event, MacState0
+    ),
+    State = lists:foldl(fun apply_effect/2, State0#?MODULE{machine = MacState}, Effects),
+    {noreply, State}.
 
-%% Sort fragment trailers by offset, ascending.
-sort_infos(Infos) when is_list(Infos) ->
-    lists:sort(
-        fun(#fragment_info{offset = OffsetA}, #fragment_info{offset = OffsetB}) ->
-            OffsetA =< OffsetB
-        end,
-        Infos
-    ).
+-spec apply_effect(effect(), #?MODULE{}) -> #?MODULE{}.
+apply_effect(#reply{to = To, response = Response}, State) ->
+    ok = gen_server:reply(To, Response),
+    State;
+apply_effect(#register_offset_listener{writer_pid = Pid, offset = Offset}, State) ->
+    ok = osiris:register_offset_listener(Pid, Offset, {?MODULE, format_osiris_event, []}),
+    State;
+apply_effect(#upload_fragment{} = Event, State) ->
+    spawn_task(Event, State);
+apply_effect(#upload_manifest{} = Event, State) ->
+    spawn_task(Event, State);
+apply_effect(#rebalance_manifest{} = Event, State) ->
+    spawn_task(Event, State);
+apply_effect(#download_manifest{} = Event, State) ->
+    spawn_task(Event, State).
 
-upload_fragment(
-    WriterRef,
-    Dir,
-    #fragment{
-        segment_offset = SegmentOffset,
-        segment_pos = SegmentPos,
-        first_offset = FragmentOffset,
-        first_timestamp = Ts,
-        next_offset = NextOffset,
-        checksum = Checksum0,
-        num_chunks = {IdxStart, IdxLen},
-        seq_no = SeqNo,
-        size = Size
-    } = Fragment
-) ->
+spawn_task(Effect, #?MODULE{tasks = Tasks0} = State0) ->
+    %% NOTE: use of `erlang:self/0` is intentional here. If we casted to the
+    %% server's registered name instead, a restarted manifest server after a
+    %% crash could get nonsensical task events from old incarnations.
+    {TaskPid, _MRef} = spawn_monitor(?MODULE, execute_task, [Effect, self()]),
+    State0#?MODULE{tasks = Tasks0#{TaskPid => Effect}}.
+
+execute_task(Effect, ManifestServer) ->
+    Event = execute_task(Effect),
+    gen_server:cast(ManifestServer, #task_completed{task_pid = self(), event = Event}).
+
+execute_task(#upload_fragment{
+    writer_ref = WriterRef,
+    dir = Dir,
+    fragment =
+        #fragment{
+            segment_offset = SegmentOffset,
+            segment_pos = SegmentPos,
+            first_offset = FragmentOffset,
+            first_timestamp = Ts,
+            next_offset = NextOffset,
+            checksum = Checksum0,
+            num_chunks = {IdxStart, IdxLen},
+            seq_no = SeqNo,
+            size = Size
+        } = Fragment
+}) ->
     Timeout = application:get_env(rabbitmq_stream_s3, segment_upload_timeout, 45_000),
     {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
     {ok, Handle} = rabbitmq_aws:open_connection("s3"),
@@ -747,7 +505,7 @@ upload_fragment(
     ),
 
     try
-        {UploadMSec, {UploadSize, Trailer}} = timer:tc(
+        {UploadMSec, {UploadSize, FragmentInfo}} = timer:tc(
             fun() ->
                 {ok, SegFd} = file:open(filename:join(Dir, SegmentFilename), [read, raw, binary]),
                 {ok, IdxFd} = file:open(filename:join(Dir, IndexFilename), [read, raw, binary]),
@@ -817,98 +575,18 @@ upload_fragment(
         %% TODO: update counters for fragments.
         rabbitmq_stream_s3_counters:segment_uploaded(UploadSize),
 
-        ok = gen_server:cast(?SERVER, {fragment_uploaded, WriterRef, Trailer})
+        #fragment_uploaded{writer_ref = WriterRef, info = FragmentInfo}
     after
         ok = rabbitmq_aws:close_connection(Handle)
-    end.
-
--doc """
-Apply successfully uploaded fragments to their stream's manifest.
-
-This function also evaluates whether the manifest should be rebalanced and/or
-uploaded to the remote tier.
-""".
-apply_infos(
-    [], #manifest{entries = Entries} = Manifest, {last_uploaded, _} = UploadStatus0, Tasks0, Dir
-) when
-    ?ENTRIES_LEN(Entries) >= 2 * ?MANIFEST_BRANCHING_FACTOR
-->
-    %% The manifest is loaded. Try to rebalance away a group. TODO see if we
-    %% can improve this "load factor." It's pretty simple at the moment.
-    case rabbitmq_stream_s3_log_manifest_entry:rebalance(Entries) of
-        undefined ->
-            ?LOG_DEBUG("Manifest is loaded but rebalancing is not possible.", []),
-            {Manifest, UploadStatus0, Tasks0};
-        {GroupKind, GroupSize, Group, Rebalanced} ->
-            ?LOG_DEBUG("Compacting away ~b kind ~b's from entries of byte size ~b", [
-                ?MANIFEST_BRANCHING_FACTOR, GroupKind, byte_size(Entries)
-            ]),
-            {_, MRef} = spawn_monitor(fun() ->
-                rebalance_manifest(Dir, GroupKind, GroupSize, Group, Rebalanced, Manifest)
-            end),
-            Tasks = Tasks0#{MRef => {rebalance_manifest, Dir}},
-            {Manifest, {uploading, []}, Tasks}
     end;
-apply_infos([], Manifest, {last_uploaded, NumUpdates}, Tasks0, Dir) when
-    NumUpdates >= ?FRAGMENT_UPLOADS_PER_MANIFEST_UPDATE
-->
-    %% Updates have been debounced but there have been enough that now it is
-    %% time to perform the upload.
-    case NumUpdates of
-        infinity ->
-            ?LOG_DEBUG("Forcing upload of manifest");
-        _ when is_integer(NumUpdates) ->
-            ?LOG_DEBUG("Uploading manifest because there have been ~b updates since last upload", [
-                NumUpdates
-            ])
-    end,
-    {_, MRef} = spawn_monitor(fun() -> upload_manifest(Dir, Manifest) end),
-    Tasks = Tasks0#{MRef => {rebalance_manifest, Dir}},
-    {Manifest, {uploading, []}, Tasks};
-apply_infos([], Manifest, UploadStatus, Tasks, _Dir) ->
-    %% The manifest is currently being uploaded, or there are no updates
-    %% necessary. Skip the upload.
-    ?LOG_DEBUG("Skipping upload of manifest with status ~w", [UploadStatus]),
-    {Manifest, UploadStatus, Tasks};
-apply_infos(
-    [#fragment_info{offset = Offset, timestamp = Ts, seq_no = SeqNo, size = Size} | Rest],
-    undefined,
-    UploadStatus0,
-    Tasks,
-    Dir
-) ->
-    ?assertEqual({last_uploaded, 0}, UploadStatus0),
-    %% The very first fragment in the manifest. Create a new manifest.
-    Manifest = #manifest{
-        first_offset = Offset,
-        first_timestamp = Ts,
-        total_size = Size,
-        entries = ?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, <<>>)
-    },
-    %% And force its upload.
-    UploadStatus = {last_uploaded, infinity},
-    apply_infos(Rest, Manifest, UploadStatus, Tasks, Dir);
-apply_infos([Fragment | Rest], Manifest, {uploading, Pending0}, Tasks, Dir) ->
-    %% The manifest is currently being uploaded. Queue the fragment for later
-    %% application once the current upload completes.
-    apply_infos(Rest, Manifest, {uploading, [Fragment | Pending0]}, Tasks, Dir);
-apply_infos(
-    [#fragment_info{offset = Offset, timestamp = Ts, seq_no = SeqNo, size = Size} | Rest],
-    #manifest{total_size = TotalSize0, entries = Entries0} = Manifest0,
-    {last_uploaded, NumUpdates0},
-    Tasks,
-    Dir
-) ->
-    %% Common case: the manifest exists. Append the fragment to the entries.
-    Manifest = Manifest0#manifest{
-        total_size = TotalSize0 + Size,
-        entries =
-            <<Entries0/binary,
-                ?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, <<>>)/binary>>
-    },
-    apply_infos(Rest, Manifest, {last_uploaded, NumUpdates0 + 1}, Tasks, Dir).
-
-rebalance_manifest(Dir, GroupKind, GroupSize, GroupEntries, RebalancedEntries, Manifest0) ->
+execute_task(#rebalance_manifest{
+    dir = Dir,
+    kind = GroupKind,
+    size = GroupSize,
+    new_group = GroupEntries,
+    rebalanced = RebalancedEntries,
+    manifest = Manifest0
+}) ->
     {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
     Ext = group_extension(GroupKind),
     ?ENTRY(GroupOffset, Ts, _, _, _, _) = GroupEntries,
@@ -938,13 +616,13 @@ rebalance_manifest(Dir, GroupKind, GroupSize, GroupEntries, RebalancedEntries, M
     after
         ok = rabbitmq_aws:close_connection(Handle)
     end,
-
     Manifest = Manifest0#manifest{entries = RebalancedEntries},
-
-    ok = gen_server:cast(?SERVER, {rebalanced_manifest, Dir, Manifest}).
-
-upload_manifest(Dir, #manifest{
-    first_offset = Offset, first_timestamp = Ts, total_size = Size, entries = Entries
+    #manifest_rebalanced{dir = Dir, manifest = Manifest};
+execute_task(#upload_manifest{
+    dir = Dir,
+    manifest = #manifest{
+        first_offset = Offset, first_timestamp = Ts, total_size = Size, entries = Entries
+    }
 }) ->
     {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
     {ok, Handle} = rabbitmq_aws:open_connection("s3"),
@@ -964,13 +642,12 @@ upload_manifest(Dir, #manifest{
             Dir, UploadMsec, ManifestSize
         ]),
         rabbitmq_stream_s3_counters:manifest_written(ManifestSize),
-
-        ok = gen_server:cast(?SERVER, {manifest_uploaded, Dir})
+        ok
     after
         ok = rabbitmq_aws:close_connection(Handle)
-    end.
-
-download_manifest(Dir) ->
+    end,
+    #manifest_uploaded{dir = Dir};
+execute_task(#download_manifest{dir = Dir}) ->
     {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
     {ok, Handle} = rabbitmq_aws:open_connection("s3"),
     Key = manifest_key(Dir),
@@ -991,7 +668,7 @@ download_manifest(Dir) ->
         after
             ok = rabbitmq_aws:close_connection(Handle)
         end,
-    ok = gen_server:cast(?SERVER, {manifest, Dir, Manifest}).
+    #manifest_downloaded{dir = Dir, manifest = Manifest}.
 
 group_extension(?MANIFEST_KIND_GROUP) -> "group";
 group_extension(?MANIFEST_KIND_KILO_GROUP) -> "kgroup";
@@ -1177,3 +854,7 @@ maybe_setup_credentials(AccessKey, SecretKey) -> rabbitmq_aws:set_credentials(Ac
 
 maybe_setup_region(undefined) -> ok;
 maybe_setup_region(Region) -> rabbitmq_aws:set_region(Region).
+
+-spec metadata() -> rabbitmq_stream_s3_log_manifest_machine:metadata().
+metadata() ->
+    #{time => erlang:monotonic_time()}.

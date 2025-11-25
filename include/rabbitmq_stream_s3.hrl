@@ -6,6 +6,7 @@
 -define(SEGMENT_HEADER_B, 8).
 -define(SEGMENT_VERSION, 1).
 -define(SEGMENT_HEADER, <<"OSIL", ?SEGMENT_VERSION:32/unsigned>>).
+-define(SEGMENT_HEADER_HASH, erlang:crc32(?SEGMENT_HEADER)).
 -define(IDX_HEADER_B, 8).
 -define(IDX_VERSION, 1).
 -define(IDX_HEADER, ?IDX_HEADER(<<>>)).
@@ -156,3 +157,81 @@
 -define(MAX_SEGMENT_SIZE_BYTES, 536_870_912).
 
 -type byte_offset() :: non_neg_integer().
+-type checksum() :: non_neg_integer().
+
+%% rabbitmq_stream_s3_log_manifest_machine types:
+
+%% Set by `rabbit_stream_queue:make_stream_conf/1'.
+-type writer_ref() :: rabbit_amqqueue:name().
+
+-record(fragment, {
+    segment_offset :: osiris:offset(),
+    segment_pos = ?SEGMENT_HEADER_B :: pos_integer(),
+    %% Number of chunks in prior fragments and number in current fragment.
+    num_chunks = {0, 0} :: {non_neg_integer(), non_neg_integer()},
+    first_offset :: osiris:offset() | undefined,
+    first_timestamp :: osiris:timestamp() | undefined,
+    last_offset :: osiris:offset() | undefined,
+    next_offset :: osiris:offset() | undefined,
+    %% Zero-based increasing integer for sequence number within the segment.
+    seq_no = 0 :: non_neg_integer(),
+    %% NOTE: header size is not included.
+    size = 0 :: non_neg_integer(),
+    %% TODO: do checksum during upload if undefined.
+    checksum = ?SEGMENT_HEADER_HASH :: checksum() | undefined
+}).
+
+%% Events.
+
+%% The writer has written enough data and the given fragment is ready to be
+%% handed off to the manifest.
+-record(fragment_available, {writer_ref :: writer_ref(), fragment :: #fragment{}}).
+%% The writer notified the manifest that the commit offset has moved forward.
+-record(commit_offset_increased, {writer_ref :: writer_ref(), offset :: osiris:offset()}).
+-record(fragment_uploaded, {writer_ref :: writer_ref(), info :: #fragment_info{}}).
+-record(manifest_uploaded, {dir :: file:filename_all()}).
+-record(manifest_rebalanced, {dir :: file:filename_all(), manifest :: #manifest{}}).
+-record(manifest_requested, {requester :: gen_server:from(), dir :: file:filename_all()}).
+-record(manifest_downloaded, {dir :: file:filename_all(), manifest :: #manifest{} | undefined}).
+-record(writer_spawned, {
+    pid :: pid(),
+    reply_tag :: gen_server:reply_tag(),
+    writer_ref :: writer_ref(),
+    dir :: file:filename_all()
+}).
+
+-type event() ::
+    #fragment_available{}
+    | #commit_offset_increased{}
+    | #fragment_uploaded{}
+    | #manifest_uploaded{}
+    | #manifest_rebalanced{}
+    | #manifest_requested{}
+    | #manifest_downloaded{}
+    | #writer_spawned{}.
+
+%% Effects.
+
+-record(upload_fragment, {
+    writer_ref :: writer_ref(), dir :: file:filename_all(), fragment :: #fragment{}
+}).
+-record(register_offset_listener, {writer_pid :: pid(), offset :: osiris:offset() | -1}).
+-record(upload_manifest, {dir :: file:filename_all(), manifest :: #manifest{}}).
+-record(rebalance_manifest, {
+    dir :: file:filename_all(),
+    kind :: rabbitmq_stream_s3_log_manifest_entry:kind(),
+    size :: pos_integer(),
+    new_group :: rabbitmq_stream_s3_log_manifest_entry:entries(),
+    rebalanced :: rabbitmq_stream_s3_log_manifest_entry:entries(),
+    manifest :: #manifest{}
+}).
+-record(download_manifest, {dir :: file:filename_all()}).
+-record(reply, {to :: gen_server:from(), response :: term()}).
+
+-type effect() ::
+    #download_manifest{}
+    | #rebalance_manifest{}
+    | #register_offset_listener{}
+    | #reply{}
+    | #upload_fragment{}
+    | #upload_manifest{}.
