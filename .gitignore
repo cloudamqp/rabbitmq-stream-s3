@@ -16,3 +16,4 @@
 /xrefr
 
 rabbitmq_stream_s3.d
+.rabbitmq_stream_s3.plt
