@@ -36,10 +36,10 @@
 }).
 
 -record(state, {
-    connection :: pid(),
+    connection :: rabbitmq_aws:connection_handle(),
     buffer = <<>> :: binary(),
-    offset_start :: byte_offset(),
-    offset_end :: byte_offset(),
+    offset_start :: byte_offset() | undefined,
+    offset_end :: byte_offset() | undefined,
     read_size :: pos_integer(),
     bucket :: binary(),
     object :: binary(),
@@ -242,11 +242,11 @@ chunk_iterator(#?MODULE{mode = Local0} = State0, Credit, PrevIter) ->
 iterator_next(#remote_iterator{next_offset = NextOffset0, data = Data0} = Iter0) ->
     case Data0 of
         ?REC_MATCH_SIMPLE(Len, Rem0) ->
-            <<Record:Len/binary, Rem>> = Rem0,
+            <<Record:Len/binary, Rem/binary>> = Rem0,
             Iter = Iter0#remote_iterator{next_offset = NextOffset0 + 1, data = Rem},
             {{NextOffset0, Record}, Iter};
         ?REC_MATCH_SUBBATCH(CompType, NumRecs, UncompressedLen, Len, Rem0) ->
-            <<BatchData:Len/binary, Rem>> = Rem0,
+            <<BatchData:Len/binary, Rem/binary>> = Rem0,
             Record = {batch, NumRecs, CompType, UncompressedLen, BatchData},
             Iter = Iter0#remote_iterator{next_offset = NextOffset0 + NumRecs, data = Rem},
             {{NextOffset0, Record}, Iter};
@@ -266,7 +266,7 @@ start_link(Reader, Bucket, Key) ->
 init({Reader, Bucket, Key}) ->
     erlang:monitor(process, Reader),
     {ok, Connection} = rabbitmq_aws:open_connection("s3", []),
-    Size = rabbitmq_stream_s3_api:get_object_size(
+    {ok, Size} = rabbitmq_stream_s3_api:get_object_size(
         Connection,
         Bucket,
         Key,
@@ -314,7 +314,7 @@ terminate(_Reason, #state{connection = Connection}) ->
 
 format_status(#{state := #state{buffer = Buffer} = State0} = Status0) ->
     %% Avoid formatting the buffer - it can be large.
-    Size = lists:flatten(io_lib:format("~b bytes", [byte_size(Buffer)])),
+    Size = iolist_to_binary(io_lib:format("~b bytes", [byte_size(Buffer)])),
     Status0#{state := State0#state{buffer = Size}}.
 
 code_change(_, _, State) ->
@@ -472,9 +472,7 @@ read_header2(
                         next_offset = NextChId0 + NumRecords,
                         position = NextPosition
                     },
-                    read_header(Remote);
-                {retry_with, Filter} ->
-                    read_header(Remote0#remote{filter = Filter})
+                    read_header(Remote)
             end;
         false ->
             %% skip and recurse
@@ -560,9 +558,15 @@ convert_remote_to_local(#?MODULE{
     init_local_reader(first, Config).
 
 %% TODO: make this generic for timestamps too.
--spec find_fragment_for_offset(osiris:offset(), #manifest{}, file:filename_all()) ->
+-spec find_fragment_for_offset(
+    osiris:offset(),
+    #manifest{} | rabbitmq_stream_s3_binary_array:array(),
+    file:filename_all()
+) ->
     {ok, ChunkId :: osiris:offset(), byte_offset(), Fragment :: osiris:offset()}.
 find_fragment_for_offset(Offset, #manifest{entries = Entries}, Dir) ->
+    find_fragment_for_offset(Offset, Entries, Dir);
+find_fragment_for_offset(Offset, Entries, Dir) ->
     RootIdx0 =
         rabbitmq_stream_s3_binary_array:partition_point(
             fun(?ENTRY(O, _T, _K, _S, _N, _)) -> Offset > O end,
@@ -619,7 +623,7 @@ find_fragment_for_offset(Offset, #manifest{entries = Entries}, Dir) ->
                 _:70,
                 GroupEntries/binary
             >> = get_group(Dir, Kind, EntryOffset),
-            find_fragment_for_offset(Dir, Offset, GroupEntries)
+            find_fragment_for_offset(Offset, GroupEntries, Dir)
     end.
 
 saturating_decr(0) -> 0;

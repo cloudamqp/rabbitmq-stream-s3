@@ -23,40 +23,41 @@
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include_lib("kernel/include/logger.hrl").
 
--define(DEFAULT_OPTS, []).
-
--spec put_object(term(), binary(), binary(), binary()) ->
+-spec put_object(rabbitmq_aws:connection_handle(), binary(), binary(), iodata()) ->
     ok | {error, term()}.
 put_object(Handle, Bucket, Key, Object) ->
     put_object(Handle, Bucket, Key, Object, []).
 
--spec put_object(term(), binary(), binary(), binary(), list()) ->
+-spec put_object(rabbitmq_aws:connection_handle(), binary(), binary(), iodata(), list()) ->
     ok | {error, term()}.
-put_object(Handle, Bucket, Key, Object, Opts) ->
+put_object(Handle, Bucket, Key, Object, Opts) when is_list(Opts) ->
     Path = object_path(Bucket, Key),
-    Headers =
+    {Headers, Opts1} =
         case proplists:get_value(crc32, Opts, []) of
             [] ->
-                [];
+                {[], Opts};
             Checksum when is_integer(Checksum) ->
                 C = base64:encode_to_string(<<Checksum:32/unsigned>>),
-                [{"x-amz-checksum-crc32", C}]
+                O = proplists:delete(crc32, Opts),
+                {[{"x-amz-checksum-crc32", C}], O}
         end,
-    case rabbitmq_aws:put(Handle, Path, Object, Headers, [?DEFAULT_OPTS | Opts]) of
+    case rabbitmq_aws:put(Handle, Path, Object, Headers, Opts1) of
         {ok, {_Headers, <<>>}} ->
             ok;
         Error ->
             {error, Error}
     end.
 
--spec get_object(term(), binary(), binary()) ->
+-spec get_object(rabbitmq_aws:connection_handle(), binary(), binary()) ->
     {ok, binary()} | {error, term()}.
 get_object(Handle, Bucket, Key) ->
     get_object(Handle, Bucket, Key, []).
 
+-spec get_object(rabbitmq_aws:connection_handle(), binary(), binary(), list()) ->
+    {ok, binary()} | {error, term()}.
 get_object(Handle, Bucket, Key, Opts) ->
     Path = object_path(Bucket, Key),
-    case rabbitmq_aws:get(Handle, Path, [], [?DEFAULT_OPTS | Opts]) of
+    case rabbitmq_aws:get(Handle, Path, [], Opts) of
         {ok, {_Headers, Body}} ->
             {ok, Body};
         {error, "Not Found", _} ->
@@ -65,27 +66,33 @@ get_object(Handle, Bucket, Key, Opts) ->
             {error, Error}
     end.
 
--spec get_object_attributes(term(), binary(), binary()) ->
-    {ok, proplists:proplist()} | {error, term()}.
+-spec get_object_attributes(rabbitmq_aws:connection_handle(), binary(), binary()) ->
+    {ok, [{binary(), binary()}]} | {error, term()}.
 get_object_attributes(Handle, Bucket, Key) ->
     get_object_attributes(Handle, Bucket, Key, []).
 get_object_attributes(Handle, Bucket, Key, Opts) ->
     get_object_attributes(Handle, Bucket, Key, [], Opts).
 
--spec get_object_attributes(term(), binary(), binary(), [string()], [term()]) ->
-    {ok, proplists:proplist()} | {error, term()}.
+-spec get_object_attributes(
+    rabbitmq_aws:connection_handle(),
+    binary(),
+    binary(),
+    [binary()],
+    [term()]
+) ->
+    {ok, [{binary(), binary()}]} | {error, term()}.
 get_object_attributes(Handle, Bucket, Key, Attributes, Opts) ->
     Path = object_path(Bucket, Key),
-    case rabbitmq_aws:request(Handle, head, Path, <<"">>, [], [?DEFAULT_OPTS | Opts]) of
+    case rabbitmq_aws:request(Handle, head, Path, <<"">>, [], Opts) of
         {ok, {Headers, _Body}} ->
-            {ok, parse_head_response_headers(Headers, Attributes)};
+            {ok, filter_attributes(Headers, Attributes)};
         {error, "Not Found", _} ->
             {error, not_found};
         Error ->
             {error, Error}
     end.
 
--spec get_object_with_range(term(), binary(), binary(), range_spec()) ->
+-spec get_object_with_range(rabbitmq_aws:connection_handle(), binary(), binary(), range_spec()) ->
     {ok, binary()} | {error, term()}.
 get_object_with_range(Handle, Bucket, Key, RangeSpec) ->
     get_object_with_range(Handle, Bucket, Key, RangeSpec, []).
@@ -94,7 +101,7 @@ get_object_with_range(Handle, Bucket, Key, RangeSpec0, Opts) ->
     Path = object_path(Bucket, Key),
     RangeValue = range_specifier(RangeSpec0),
     Headers = [{"Range", lists:flatten(["bytes=" | RangeValue])}],
-    case rabbitmq_aws:get(Handle, Path, Headers, [?DEFAULT_OPTS | Opts]) of
+    case rabbitmq_aws:get(Handle, Path, Headers, Opts) of
         {ok, {_Headers, Body}} ->
             {ok, Body};
         {error, "Not Found", _} ->
@@ -112,14 +119,21 @@ range_specifier(SuffixLen) when is_integer(SuffixLen) andalso SuffixLen < 0 ->
     %% ~b will format the '-' for us.
     io_lib:format("~b", [SuffixLen]).
 
--spec get_object_size(term(), binary(), binary()) ->
-    integer() | {error, term()}.
+-spec get_object_size(rabbitmq_aws:connection_handle(), binary(), binary()) ->
+    {ok, integer()} | {error, term()}.
 get_object_size(Handle, Bucket, Key) ->
     get_object_size(Handle, Bucket, Key, []).
 
+-spec get_object_size(rabbitmq_aws:connection_handle(), binary(), binary(), [term()]) ->
+    {ok, integer()} | {error, term()}.
 get_object_size(Handle, Bucket, Key, Opts) ->
-    {ok, [{_, Size}]} = get_object_attributes(Handle, Bucket, Key, [<<"content-length">>], Opts),
-    binary_to_integer(Size).
+    case get_object_attributes(Handle, Bucket, Key, [<<"content-length">>], Opts) of
+        {ok, Attributes} ->
+            [{<<"content-length">>, Size}] = Attributes,
+            {ok, binary_to_integer(Size)};
+        Error ->
+            Error
+    end.
 
 object_path(Bucket, Key) ->
     BucketStr = ensure_string(Bucket),
@@ -131,9 +145,8 @@ ensure_string(Binary) when is_binary(Binary) ->
 ensure_string(List) when is_list(List) ->
     List.
 
-parse_head_response_headers(Headers, Attributes) ->
-    filter_attributes(Headers, Attributes).
-
+-spec filter_attributes([{binary(), binary()}], [binary()]) ->
+    [{binary(), binary()}].
 filter_attributes(Headers, []) ->
     Headers;
 filter_attributes(Headers, Attributes) ->
