@@ -29,6 +29,8 @@ jobs:
       - id: build-rabbitmq-server
         run: make -C ${{ github.workspace }}/rabbitmq-server
       - uses: actions/cache/save@v4
+        # Always overwrite an existing cache entry:
+        if: always()
         with:
           path: ${{ github.workspace }}/rabbitmq-server
           key: rmq-${{ matrix.rmq-version }}-otp-${{ matrix.otp-version }}-elixir-${{ matrix.elixir-version }}
