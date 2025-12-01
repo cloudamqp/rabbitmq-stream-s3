@@ -41,5 +41,13 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: rabbitmq-server/deps/rabbitmq_stream_s3
-      - run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3
-      - run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3 tests
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3/.rabbitmq_stream_s3.plt
+          key: plt-${{ matrix.rmq-version }}-otp-${{ matrix.otp-version }}-elixir-${{ matrix.elixir-version }}
+      - name: make
+        run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3
+      - name: tests
+        run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3 tests
+      - name: dialyze
+        run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3 dialyze
