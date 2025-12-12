@@ -222,7 +222,7 @@ apply(
 ) ->
     case Manifests0 of
         #{Dir := {#manifest{} = Manifest, _UploadStatus}} ->
-            {State0, #reply{to = Requester, response = Manifest}};
+            {State0, [#reply{to = Requester, response = Manifest}]};
         #{Dir := {pending, Requesters}} ->
             Manifests = Manifests0#{Dir := {pending, [Requester | Requesters]}},
             {State0#?MODULE{manifests = Manifests}, []};
