@@ -100,6 +100,7 @@ start() ->
     ok = rabbitmq_stream_s3_api_aws:init(),
 
     ok = rabbitmq_stream_s3_counters:init(),
+    ok = rabbitmq_stream_s3_db:setup(),
     rabbit_sup:start_child(?MODULE).
 
 -spec get_manifest(stream_id()) -> #manifest{} | undefined.

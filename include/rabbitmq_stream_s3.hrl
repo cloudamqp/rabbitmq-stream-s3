@@ -1,6 +1,8 @@
 %% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 %% SPDX-License-Identifier: Apache-2.0
 
+-include_lib("rabbit_common/include/resource.hrl").
+
 %% Prefer binaries for filenames. This is a subtype of file:filename_all().
 %% Binaries represent ASCII in a much more compact fashion than lists.
 -type filename() :: binary().
