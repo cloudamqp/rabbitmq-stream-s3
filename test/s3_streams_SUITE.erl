@@ -87,13 +87,11 @@ publish_consume(Config) ->
     ?assertEqual(ok, amqp_channel:call(Ch, #'basic.publish'{routing_key = QName},
                                        #amqp_msg{payload = Payload64M})),
 
-    % Wait for upload to complete
-    timer:sleep(500),
-
     % One fragment should exist
-    ?assertMatch({ok, [_]}, rabbit_ct_broker_helpers:rpc(Config, 0,
+    ?awaitMatch({ok, [_]}, rabbit_ct_broker_helpers:rpc(Config, 0,
                                             rabbitmq_stream_s3_api_fs,
-                                            get_stream_data, [QName])),
+                                            get_stream_data, [QName]),
+               500),
 
 
     % There should be some data in the tiered storage.
