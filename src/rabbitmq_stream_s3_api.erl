@@ -103,10 +103,10 @@ put(Conn, Key, Data, Opts) when is_binary(Key) andalso is_map(Opts) ->
     (backend()):put(Conn, Key, Data, Opts).
 
 -doc #{equiv => delete(Conn, Keys, #{})}.
--spec delete(connection(), [key()]) -> ok | {error, any()}.
+-spec delete(connection(), key() | [key()]) -> ok | {error, any()}.
 delete(Conn, Keys) when is_binary(Keys) orelse is_list(Keys) ->
     delete(Conn, Keys, #{}).
 
--spec delete(connection(), [key()], request_opts()) -> ok | {error, any()}.
+-spec delete(connection(), key() | [key()], request_opts()) -> ok | {error, any()}.
 delete(Conn, Keys, Opts) when (is_binary(Keys) orelse is_list(Keys)) andalso is_map(Opts) ->
     (backend()):delete(Conn, Keys, Opts).
