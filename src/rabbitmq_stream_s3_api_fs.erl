@@ -23,7 +23,10 @@ associated file in that folder.
         ]).
 
 % Auxiliary function for thesting
--export([get_stream_data/1]).
+-export([
+    get_stream_data/1,
+    clear/0
+]).
 
 
 -behaviour(rabbitmq_stream_s3_api).
@@ -48,10 +51,12 @@ init() ->
 """.
 -spec open() -> {ok, connection()} | {error, any()}.
 open() ->
+    ?LOG_INFO(?MODULE_STRING ": opening connection"),
     {ok, ?STORAGE_DIR}.
 
 -spec close(connection()) -> ok.
 close(_Connection) ->
+    ?LOG_INFO(?MODULE_STRING ": closing connection"),
     ok.
 
 -spec get(connection(), key(), rabbitmq_stream_s3_api:request_opts()) ->
@@ -69,17 +74,6 @@ get(Connection, Key, Opts) ->
                 Self ! {self(), {error, not_found}}
         end
     end).
-
--spec get_all(connection()) -> [{key(), binary()}].
-get_all(Connection) ->
-    ?LOG_INFO("Trying to find files in : ~p", [Connection]),
-    filelib:fold_files(Connection, ".*.fragment", true, fun(Filename, Acc) ->
-                       ?LOG_INFO("Found file: ~p", [Filename]),
-                       Key = filename:basename(Filename),
-                       {ok, Data} = file:read_file(Filename),
-                       [{Key, Data} | Acc]
-                   end, []).
-
 
 -spec get_range(connection(), key(), rabbitmq_stream_s3_api:range_spec(), rabbitmq_stream_s3_api:request_opts()) ->
     {ok, binary()} | {error, any()}.
@@ -144,15 +138,19 @@ get_stream_data(StreamName0) ->
     StreamNameWildcard = binary_to_list(<<"*", StreamName0/binary, "*">>),
     case filelib:wildcard(string:join([?STORAGE_DIR,"**", StreamNameWildcard, "**", "*manifest"], "/")) of
         [] -> {error, not_found};
-        [_Manifest] ->
+        [Manifest] ->
             Fragments = filelib:wildcard(string:join([?STORAGE_DIR,
                                                       "**",
                                                       StreamNameWildcard,
                                                       "**",
                                                       "*.fragment"],
                                                      "/")),
-            {ok, Fragments}
+            {ok, Manifest, Fragments}
     end.
+
+-spec clear() -> ok | {error, any()}.
+clear() ->
+    file:del_dir_r(?STORAGE_DIR).
 
 
 with_timeout(Timeout, Fun) ->
@@ -161,6 +159,7 @@ with_timeout(Timeout, Fun) ->
         {Pid, Result} -> Result
     after
         Timeout ->
+            ?LOG_INFO(?MODULE_STRING ": operation timeouted"),
             exit(Pid, kill),
             {error, timout}
     end.

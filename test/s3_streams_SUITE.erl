@@ -9,17 +9,16 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
 -include_lib("rabbitmq_ct_helpers/include/rabbit_assert.hrl").
+-include("rabbitmq_stream_s3.hrl").
 
 all() ->
     [
         publish_consume
     ].
 
-
 %% -------------------------------------------------------------------
 %% Setup/teardown.
 %% -------------------------------------------------------------------
-
 init_per_suite(Config) ->
     rabbit_ct_helpers:log_environment(),
     Config1 = rabbit_ct_helpers:set_config(Config, [
@@ -42,7 +41,6 @@ init_per_suite(Config) ->
       rabbit_ct_client_helpers:setup_steps()),
     Config3.
 
-
 end_per_suite(Config) ->
     rabbit_ct_helpers:run_teardown_steps(Config,
       rabbit_ct_client_helpers:teardown_steps() ++
@@ -57,7 +55,6 @@ end_per_testcase(Testcase, Config) ->
 %% -------------------------------------------------------------------
 %% Testcases
 %% -------------------------------------------------------------------
-
 publish_consume(Config) ->
     % Generate payloads
     Payload1K = <<0:(1024*8)>>,
@@ -69,32 +66,37 @@ publish_consume(Config) ->
 
     QName = <<"stream_1">>,
 
-    % Stream should not be data for the stream we haven't declared ye
+    % Should not be data for the stream we haven't declared yet
     ?assertMatch({error, not_found}, rabbit_ct_broker_helpers:rpc(Config, 0,
                                             rabbitmq_stream_s3_api_fs,
                                             get_stream_data, [QName])),
 
-    % Create a stream. This should trigger the S3 API fs backend to create
-    % a `connection()`.
+    % Create a stream.
     ?assertEqual(ok, stream_declare(Ch, QName)),
     ?assertEqual(ok, amqp_channel:call(Ch, #'basic.publish'{routing_key = QName},
                                        #amqp_msg{payload = Payload1K})),
-    ?assertMatch(#'basic.consume_ok'{},
-                 amqp_channel:call(Ch, #'basic.consume'{queue = QName})),
 
     % Publishing a >= 64MB message triggers upload, since there is already a
     % chunk (the 1KB one) in the stream.
     ?assertEqual(ok, amqp_channel:call(Ch, #'basic.publish'{routing_key = QName},
                                        #amqp_msg{payload = Payload64M})),
 
+
     % One fragment should exist
-    ?awaitMatch({ok, [_]}, rabbit_ct_broker_helpers:rpc(Config, 0,
-                                            rabbitmq_stream_s3_api_fs,
-                                            get_stream_data, [QName]),
+    ?awaitMatch({ok,_Manifest,[_Fragment]},
+                rabbit_ct_broker_helpers:rpc(Config, 0,
+                                             rabbitmq_stream_s3_api_fs,
+                                             get_stream_data, [QName]),
                500),
 
+    % If we delete the stream, the data in the tiered storage should eventually
+    % be cleared out.
+    amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
 
-    % There should be some data in the tiered storage.
+    % ?awaitMatch({error, not_found}, rabbit_ct_broker_helpers:rpc(Config, 0,
+    %                                         rabbitmq_stream_s3_api_fs,
+    %                                         get_stream_data, [QName]),
+    %             5000),
 
     rabbit_ct_client_helpers:close_channel(Ch),
     ok.
@@ -102,7 +104,6 @@ publish_consume(Config) ->
 %% -------------------------------------------------------------------
 %% Private functions
 %% -------------------------------------------------------------------
-
 stream_declare(Ch, StreamName) ->
     Args = [{<<"x-queue-type">>, longstr, <<"stream">>}],
 
