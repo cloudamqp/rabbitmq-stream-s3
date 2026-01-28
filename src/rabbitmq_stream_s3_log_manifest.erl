@@ -35,8 +35,9 @@
 -record(init_writer, {
     pid :: pid(),
     stream :: stream_id(),
-    reference :: stream_reference(),
     dir :: directory(),
+    epoch :: osiris:epoch(),
+    reference :: stream_reference(),
     %% Corresponds to the `replica_nodes` key passed in `osiris:config()` for
     %% writers.
     replica_nodes :: [node()],
@@ -240,6 +241,7 @@ init_manifest(
     #{
         dir := Dir0,
         name := StreamId0,
+        epoch := Epoch,
         reference := Reference,
         replica_nodes := ReplicaNodes
     } = Config0,
@@ -273,8 +275,9 @@ init_manifest(
     ok = gen_server:cast(?SERVER, #init_writer{
         pid = self(),
         stream = StreamId,
-        reference = Reference,
         dir = Dir,
+        epoch = Epoch,
+        reference = Reference,
         replica_nodes = ReplicaNodes,
         retention = maps:get(retention, Config0, []),
         available_fragments = Available
@@ -436,8 +439,9 @@ handle_cast(
     #init_writer{
         pid = Pid,
         stream = StreamId,
-        reference = Reference,
         dir = Dir,
+        epoch = Epoch,
+        reference = Reference,
         replica_nodes = ReplicaNodes,
         retention = Retention
     },
@@ -448,6 +452,8 @@ handle_cast(
         pid = Pid,
         stream = StreamId,
         dir = Dir,
+        epoch = Epoch,
+        reference = Reference,
         replica_nodes = ReplicaNodes,
         retention = Retention
     },
@@ -774,6 +780,8 @@ execute_task(#rebalance_manifest{
     #manifest_rebalanced{stream = StreamId, manifest = Manifest};
 execute_task(#upload_manifest{
     stream = StreamId,
+    epoch = Epoch,
+    reference = Reference,
     manifest = #manifest{
         first_offset = Offset,
         first_timestamp = Ts,

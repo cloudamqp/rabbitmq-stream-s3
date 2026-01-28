@@ -3,6 +3,12 @@
 
 -include_lib("rabbit_common/include/resource.hrl").
 
+%% A logical identifier for a stream. This is set to be the stream queue's
+%% resource name by RabbitMQ. This term is used for the `{osiris_offset,
+%% stream_reference(), osiris:offset()}' message sent by Osiris and to trigger
+%% deletion based on the queue name from the metadata store.
+-type stream_reference() :: rabbit_amqqueue:name().
+
 %% Prefer binaries for filenames. This is a subtype of file:filename_all().
 %% Binaries represent ASCII in a much more compact fashion than lists.
 -type filename() :: binary().
@@ -205,12 +211,6 @@
 %% creation timestamp, concatenated with "_".
 -type stream_id() :: binary().
 
-%% An opaque term used to identify a logical stream. This is set to be the
-%% stream queue's `amqqueue:name()' by RabbitMQ. This term is only used for
-%% the `{osiris_offset, stream_reference(), osiris:offset()}' message sent
-%% by Osiris.
--type stream_reference() :: term().
-
 -record(fragment, {
     first_offset :: osiris:offset() | undefined,
     last_offset :: osiris:offset() | undefined,
@@ -262,8 +262,9 @@
 }).
 -record(writer_spawned, {
     stream :: stream_id(),
-    reference :: stream_reference(),
     dir :: directory(),
+    epoch :: osiris:epoch(),
+    reference :: stream_reference(),
     pid :: pid(),
     replica_nodes = [] :: [node()],
     retention = [] :: [osiris:retention_spec()],
@@ -317,6 +318,8 @@
 }).
 -record(upload_manifest, {
     stream :: stream_id(),
+    epoch :: osiris:epoch(),
+    reference :: stream_reference(),
     manifest :: #manifest{}
 }).
 -record(rebalance_manifest, {

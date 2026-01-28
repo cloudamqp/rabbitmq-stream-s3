@@ -46,6 +46,8 @@ for the log manifest server to execute.
     retention := retention_spec(),
     %% Local log's directory.
     dir := directory(),
+    epoch := osiris:epoch(),
+    reference := stream_reference(),
     manifest := manifest(),
     %% Number of fragments applied to the manifest since the last upload.
     modifications := non_neg_integer(),
@@ -86,8 +88,17 @@ for the log manifest server to execute.
 
 -export([new/0, new/1, get_manifest/2, apply/3]).
 
--spec writer(pid(), [node()], directory(), retention_spec(), [#fragment{}]) -> writer().
-writer(Pid, ReplicaNodes, Dir, Retention, Available) ->
+-spec writer(
+    pid(),
+    [node()],
+    directory(),
+    osiris:epoch(),
+    stream_reference(),
+    retention_spec(),
+    [#fragment{}]
+) ->
+    writer().
+writer(Pid, ReplicaNodes, Dir, Epoch, Reference, Retention, Available) ->
     ?assertEqual(node(Pid), node()),
     #{
         kind => writer,
@@ -95,6 +106,8 @@ writer(Pid, ReplicaNodes, Dir, Retention, Available) ->
         ranges => #{Node => {0, 0} || Node <- [node() | ReplicaNodes]},
         retention => Retention,
         dir => Dir,
+        epoch => Epoch,
+        reference => Reference,
         manifest => {pending, []},
         pending_change => none,
         modifications => 0,
@@ -273,6 +286,8 @@ apply(
         pid = Pid,
         stream = StreamId,
         dir = Dir,
+        epoch = Epoch,
+        reference = Reference,
         replica_nodes = ReplicaNodes,
         retention = Retention0,
         available_fragments = Available
@@ -280,7 +295,7 @@ apply(
     #?MODULE{streams = Streams0} = State0
 ) ->
     Retention = #{K => V || {K, V} <- Retention0, K =:= max_age orelse K =:= max_bytes},
-    Writer0 = writer(Pid, ReplicaNodes, Dir, Retention, Available),
+    Writer0 = writer(Pid, ReplicaNodes, Dir, Epoch, Reference, Retention, Available),
     Effects0 = [#register_offset_listener{writer_pid = Pid, offset = -1}],
     case Streams0 of
         #{StreamId := #{manifest := {pending, Pending0}}} ->
