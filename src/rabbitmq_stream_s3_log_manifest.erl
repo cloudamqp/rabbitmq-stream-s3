@@ -98,7 +98,7 @@
 ).
 
 start() ->
-    ok = rabbitmq_stream_s3_api_aws:init(),
+    ok = rabbitmq_stream_s3_api:init(),
 
     ok = rabbitmq_stream_s3_counters:init(),
     ok = rabbitmq_stream_s3_db:setup(),

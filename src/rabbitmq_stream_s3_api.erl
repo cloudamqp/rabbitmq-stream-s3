@@ -14,6 +14,7 @@ TODO: make another back end that uses the CommonTest priv directory and
 file-system operations. Use that in non-unit tests.
 """.
 -export([
+    init/0,
     open/0,
     close/1,
     get/2,
@@ -47,6 +48,7 @@ This identifies an object. Typically keys look like Unix paths, for example
 
 -export_type([connection/0, key/0, range_spec/0, request_opts/0]).
 
+-callback init() -> ok.
 -callback open() -> {ok, connection()} | {error, any()}.
 -callback close(connection()) -> ok.
 -callback get(connection(), key(), request_opts()) -> {ok, binary()} | {error, any()}.
@@ -65,6 +67,10 @@ examples.
 
 backend() ->
     application:get_env(rabbitmq_stream_s3, ?MODULE, rabbitmq_stream_s3_api_aws).
+
+-spec init() -> ok.
+init() ->
+    (backend()):init().
 
 -spec open() -> {ok, connection()} | {error, any()}.
 open() ->
