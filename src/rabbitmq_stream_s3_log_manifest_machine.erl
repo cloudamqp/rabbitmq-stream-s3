@@ -264,17 +264,63 @@ apply(
             {State0, []}
     end;
 apply(
-    #{time := Ts},
-    #manifest_uploaded{stream = StreamId},
+    #{time := Ts} = Meta,
+    #manifest_uploaded{stream = StreamId, revision = Revision},
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
-        #{StreamId := #{kind := writer, pending_change := Pending} = Writer0} when
+        #{
+            StreamId := #{
+                kind := writer,
+                pending_change := Pending,
+                manifest := #manifest{revision = ExpectedRevision} = Manifest0
+            } = Writer0
+        } when
             Pending /= none
         ->
-            Writer = Writer0#{modifications := 0, last_uploaded := Ts, pending_change := none},
+            case Revision of
+                ExpectedRevision ->
+                    Manifest = Manifest0#manifest{revision = Revision},
+                    Writer = Writer0#{
+                        modifications := 0,
+                        last_uploaded := Ts,
+                        pending_change := none,
+                        manifest := Manifest
+                    },
+                    State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
+                    {State, []};
+                _ ->
+                    ?LOG_INFO(
+                        "received #manifest_uploaded{} for unexpected revision (expected ~b, actual ~b)",
+                        [ExpectedRevision, Revision]
+                    ),
+                    Event = #manifest_upload_rejected{
+                        stream = StreamId,
+                        expected = ExpectedRevision,
+                        actual = Revision
+                    },
+                    apply(Meta, Event, State0)
+            end;
+        _ ->
+            {State0, []}
+    end;
+apply(
+    _Meta,
+    #manifest_upload_rejected{stream = StreamId},
+    #?MODULE{streams = Streams0} = State0
+) ->
+    case Streams0 of
+        #{StreamId := #{kind := writer} = Writer0} ->
+            Writer = Writer0#{
+                pending_change := none,
+                manifest := {pending, []}
+            },
             State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
-            {State, []};
+            %% THOUGHT: add an optional payload version hint to this effect?
+            %% We could avoid returning stale manifests when the local member
+            %% is behind on Khepri replication if we prefer a consistent
+            %% query when the hint is set.
+            {State, [#resolve_manifest{stream = StreamId}]};
         _ ->
             {State0, []}
     end;
@@ -656,10 +702,13 @@ evaluate_retention(
     StreamId,
     #{
         pending_change := none,
+        epoch := Epoch,
+        reference := Reference,
         retention := RetentionSpec,
         manifest := #manifest{
             total_size = TotalSize0,
             first_timestamp = FirstTs,
+            revision = Revision0,
             entries = Entries0
         } = Manifest0
     } = Writer0,
@@ -685,9 +734,15 @@ evaluate_retention(
                     %% needs groups. Luckily, this means we can determine
                     %% which fragments can be deleted very efficiently by
                     %% looking just at manifest's entries array.
-                    {Manifest, Offsets} = evaluate_retention1(Manifest0, Now, RetentionSpec),
+                    {Manifest1, Offsets} = evaluate_retention1(Manifest0, Now, RetentionSpec),
+                    UploadManifest = #upload_manifest{
+                        stream = StreamId,
+                        epoch = Epoch,
+                        reference = Reference,
+                        manifest = Manifest1
+                    },
+                    Manifest = Manifest1#manifest{revision = Revision0 + 1},
                     Writer = Writer0#{manifest := Manifest, pending_change := retention},
-                    UploadManifest = #upload_manifest{stream = StreamId, manifest = Manifest},
                     DeleteFragments = #delete_fragments{stream = StreamId, offsets = Offsets},
                     {Writer, [UploadManifest, DeleteFragments | Effects0]};
                 _ ->
@@ -757,7 +812,9 @@ evaluate_upload(
     StreamId,
     #{
         kind := writer,
-        manifest := #manifest{} = Manifest,
+        manifest := #manifest{revision = Revision0} = Manifest0,
+        epoch := Epoch,
+        reference := Reference,
         modifications := Mods,
         last_uploaded := LastUploadTs,
         pending_change := none
@@ -775,8 +832,16 @@ evaluate_upload(
         end,
     case ExceedsDebounce of
         true ->
-            UploadManifest = #upload_manifest{stream = StreamId, manifest = Manifest},
-            Writer = Writer0#{pending_change := upload},
+            UploadManifest = #upload_manifest{
+                stream = StreamId,
+                epoch = Epoch,
+                reference = Reference,
+                manifest = Manifest0
+            },
+            Writer = Writer0#{
+                pending_change := upload,
+                manifest := Manifest0#manifest{revision = Revision0 + 1}
+            },
             {Writer, [UploadManifest | Effects0]};
         false ->
             {Writer0, Effects0}

@@ -24,7 +24,8 @@ all() ->
         recover_uploaded_fragments,
         manifest_replication,
         retention,
-        backfill_older_segments
+        backfill_older_segments,
+        manifest_upload_conflict
     ].
 
 %%----------------------------------------------------------------------------
@@ -329,7 +330,8 @@ manifest_replication(Config) ->
         ],
         Effects6
     ),
-    {_Writer6, Effects7} = ?MAC:apply(?META(), #manifest_uploaded{stream = StreamId}, Writer5),
+    ManifestUploaded1 = #manifest_uploaded{stream = StreamId, revision = 1},
+    {_Writer6, Effects7} = ?MAC:apply(?META(), ManifestUploaded1, Writer5),
     ?assertEqual([], Effects7),
     {_Replica2, Effects8} = ?MAC:apply(?META(), FragmentsApplied, Replica1),
     ?assertMatch([#set_range{next = 60}], Effects8),
@@ -394,7 +396,8 @@ retention(Config) ->
         ],
         Effects3
     ),
-    {Writer4, Effects4} = ?MAC:apply(?META(), #manifest_uploaded{stream = StreamId}, Writer3),
+    ManifestUploaded1 = #manifest_uploaded{stream = StreamId, revision = 1},
+    {Writer4, Effects4} = ?MAC:apply(?META(), ManifestUploaded1, Writer3),
     ?assertMatch([], Effects4),
 
     {Replica2, REffects2} = ?MAC:apply(?META(), FragmentsApplied1, Replica1),
@@ -417,7 +420,8 @@ retention(Config) ->
         ],
         Effects5
     ),
-    {Writer6, Effects6} = ?MAC:apply(?META(), #manifest_uploaded{stream = StreamId}, Writer5),
+    ManifestUploaded2 = #manifest_uploaded{stream = StreamId, revision = 2},
+    {Writer6, Effects6} = ?MAC:apply(?META(), ManifestUploaded2, Writer5),
     ?assertMatch([], Effects6),
 
     {Replica3, REffects3} = ?MAC:apply(?META(), FragmentsApplied2, Replica2),
@@ -464,7 +468,8 @@ retention(Config) ->
         ],
         Effects8
     ),
-    {_Writer9, Effects9} = ?MAC:apply(?META(), #manifest_uploaded{stream = StreamId}, Writer8),
+    ManifestUploaded3 = #manifest_uploaded{stream = StreamId, revision = 3},
+    {_Writer9, Effects9} = ?MAC:apply(?META(), ManifestUploaded3, Writer8),
     ?assertMatch([], Effects9),
 
     {_Replica4, REffects4} = ?MAC:apply(?META(), FragmentsApplied3, Replica3),
@@ -545,6 +550,103 @@ backfill_older_segments(Config) ->
     FragmentUploaded = #fragment_uploaded{stream = StreamId, info = fragment_to_info(Fragment3)},
     {_Mac6, Effects6} = ?MAC:apply(?META(), FragmentUploaded, Mac5),
     ?assertMatch([#set_range{first = 0, next = 120}, #upload_manifest{}], Effects6),
+    ok.
+
+manifest_upload_conflict(Config) ->
+    %% It's possible for two writers to be alive during a partition. Both could
+    %% attempt to modify the manifest in the remote tier and unwittingly
+    %% overwrite the other. We use an optimistic lock to prevent this. This
+    %% test case doesn't cover the optimistic lock - it just simulates the
+    %% lock rejecting a write.
+    Dir = directory(Config),
+    OldWriterPid = self(),
+    StreamId = erlang:make_ref(),
+    StreamRef = erlang:make_ref(),
+    [F1, F2, F3, F4] = [
+        fragment(From, To)
+     || {From, To} <- [{0, 19}, {20, 39}, {40, 59}, {60, 79}]
+    ],
+    %% Room for two of those fragments:
+    Retention = [{max_bytes, 400}],
+
+    %% OLD (deposed) writer:
+    OldWriterSpawned = #writer_spawned{
+        stream = StreamId,
+        pid = OldWriterPid,
+        dir = Dir,
+        retention = Retention,
+        epoch = 1,
+        reference = StreamRef
+    },
+    OldWriter0 = ?MAC:new(#{debounce_modifications => 1}),
+    {OldWriter1, OldEffects1} = ?MAC:apply(?META(), OldWriterSpawned, OldWriter0),
+    ?assertMatch([#resolve_manifest{}, #register_offset_listener{}], OldEffects1),
+    %% According to this writer, up to (but not including) `F4` have been committed:
+    COI1 = #commit_offset_increased{stream = StreamId, offset = 60},
+    {OldWriter2, OldEffects2} = ?MAC:apply(?META(), COI1, OldWriter1),
+    ?assertMatch([#register_offset_listener{}], OldEffects2),
+    Manifest1 = fragments_to_manifest([F1, F2, F3]),
+    Manifest1Resolved = #manifest_resolved{stream = StreamId, manifest = Manifest1},
+    {OldWriter3, OldEffects3} = ?MAC:apply(?META(), Manifest1Resolved, OldWriter2),
+    ?assertMatch([#set_range{}], OldEffects3),
+
+    %% 💣💥 PARTITION OCCURS! A new writer is elected and starts making progress
+    %% by uploading `F4`.
+    %% NEW (successor) writer:
+    NewWriterPid = spawn(fun() -> ok end),
+    NewWriterSpawned = OldWriterSpawned#writer_spawned{
+        pid = NewWriterPid,
+        epoch = 2,
+        available_fragments = [F4]
+    },
+    NewWriter0 = ?MAC:new(#{debounce_modifications => 1}),
+    {NewWriter1, NewEffects1} = ?MAC:apply(?META(), NewWriterSpawned, NewWriter0),
+    ?assertMatch([#resolve_manifest{}, #register_offset_listener{}], NewEffects1),
+    %% The new writer can make progress and can upload F4:
+    COI2 = #commit_offset_increased{stream = StreamId, offset = 80},
+    {NewWriter2, NewEffects2} = ?MAC:apply(?META(), COI2, NewWriter1),
+    ?assertMatch([#register_offset_listener{}], NewEffects2),
+    Manifest1Resolved = #manifest_resolved{stream = StreamId, manifest = Manifest1},
+    {NewWriter3, NewEffects3} = ?MAC:apply(?META(), Manifest1Resolved, NewWriter2),
+    ?assertMatch([#upload_fragment{fragment = F4}, #set_range{}], NewEffects3),
+    F4Uploaded = #fragment_uploaded{stream = StreamId, info = fragment_to_info(F4)},
+    {NewWriter4, NewEffects4} = ?MAC:apply(?META(), F4Uploaded, NewWriter3),
+    ?assertMatch(
+        [
+            #set_range{first = 40, next = 80},
+            #upload_manifest{
+                manifest = #manifest{first_offset = 40, next_offset = 80, total_size = 400}
+            },
+            #delete_fragments{offsets = [0, 20]}
+        ],
+        NewEffects4
+    ),
+    %% Say that the new writer successfully uploads a new manifest revision.
+    Manifest2Uploaded = #manifest_uploaded{stream = StreamId, revision = 1},
+    {_NewWriter5, NewEffects5} = ?MAC:apply(?META(), Manifest2Uploaded, NewWriter4),
+    ?assertMatch([], NewEffects5),
+
+    %% OLD (deposed) writer, part 2.
+    %% Say that it evaluates retention on tick. Its change to the manifest will
+    %% be rejected.
+    {OldWriter4, OldEffects4} = ?MAC:apply(?META(), #tick{}, OldWriter3),
+    ?assertMatch(
+        [
+            %% Note that it does not know about F4.
+            #set_range{first = 20, next = 60},
+            #upload_manifest{
+                manifest = #manifest{first_offset = 20, next_offset = 60, total_size = 400}
+            },
+            #delete_fragments{offsets = [0]}
+        ],
+        OldEffects4
+    ),
+    ManifestUploadRejected = #manifest_upload_rejected{stream = StreamId, expected = 0, actual = 1},
+    {_OldWriter5, OldEffects5} = ?MAC:apply(?META(), ManifestUploadRejected, OldWriter4),
+    %% Currently, we just re-resolve the manifest.
+    %% TODO: include the epoch and have the deposed writer fully step down
+    %% somehow?
+    ?assertMatch([#resolve_manifest{}], OldEffects5),
     ok.
 
 %%----------------------------------------------------------------------------

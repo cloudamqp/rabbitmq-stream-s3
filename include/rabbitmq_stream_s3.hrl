@@ -160,11 +160,16 @@
 %% = 35
 -define(ENTRY_B, 35).
 
-%% A nicer version of the above `?MANIFEST/5' macro. This is the root of the
-%% manifest. A newly created, empty manifest can be identified by checking
-%% `#manifest.next_offset =:= 0'. Checking `#manifest.total_size =:= 0' or
-%% `#manifest.entries =:= <<>>' is not sufficient since the remote tier can
-%% become empty from retention.
+%% A nicer version of the above `?MANIFEST/5' macro.
+%%
+%% This is the root of the manifest. A newly created, empty manifest can be
+%% identified by checking `#manifest.next_offset =:= 0'. Checking
+%% `#manifest.total_size =:= 0' or `#manifest.entries =:= <<>>' is not
+%% sufficient since the remote tier can become empty from retention.
+%% (TODO: is that actually true?)
+%%
+%% This record also contains the optimistic concurrency information necessary
+%% for the stream, i.e. `revision'.
 -record(manifest, {
     %% The oldest offset which has been uploaded and not yet truncated by
     %% retention.
@@ -181,6 +186,9 @@
     %% headers, index data or trailers. This is the summed `#fragment.size` of
     %% all fragments in the remote tier.
     total_size = 0 :: non_neg_integer(),
+    %% The revision the manifest was last fetched or uploaded at.
+    %% This is used for an optimistic concurrency control.
+    revision = 0 :: rabbitmq_stream_s3_db:revision(),
     %% An array of entries. Use the `?ENTRY/6' macro to access entries.
     entries = <<>> :: binary()
 }).
@@ -247,7 +255,10 @@
     stream :: stream_id(),
     info :: #fragment_info{}
 }).
--record(manifest_uploaded, {stream :: stream_id()}).
+-record(manifest_uploaded, {
+    stream :: stream_id(),
+    revision :: rabbitmq_stream_s3_db:revision()
+}).
 -record(manifest_rebalanced, {
     stream :: stream_id(),
     manifest :: #manifest{}
@@ -290,6 +301,11 @@
     stream :: stream_id(),
     retention :: [osiris:retention_spec()]
 }).
+-record(manifest_upload_rejected, {
+    stream :: stream_id(),
+    expected :: rabbitmq_stream_s3_db:revision(),
+    actual :: rabbitmq_stream_s3_db:revision()
+}).
 
 -type event() ::
     #acceptor_spawned{}
@@ -300,9 +316,10 @@
     | #manifest_rebalanced{}
     | #manifest_requested{}
     | #manifest_resolved{}
+    | #manifest_upload_rejected{}
     | #manifest_uploaded{}
-    | #tick{}
     | #retention_updated{}
+    | #tick{}
     | #writer_spawned{}.
 
 %% Effects.

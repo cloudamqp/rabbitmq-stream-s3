@@ -777,6 +777,7 @@ execute_task(#rebalance_manifest{
         ok = rabbitmq_stream_s3_api:close(Conn)
     end,
     Manifest = Manifest0#manifest{entries = RebalancedEntries},
+    %% TODO: update `rabbitmq_stream_s3_db`.
     #manifest_rebalanced{stream = StreamId, manifest = Manifest};
 execute_task(#upload_manifest{
     stream = StreamId,
@@ -787,6 +788,7 @@ execute_task(#upload_manifest{
         first_timestamp = Ts,
         next_offset = NextOffset,
         total_size = Size,
+        revision = ExpectedRevision,
         entries = Entries
     }
 }) ->
@@ -795,7 +797,7 @@ execute_task(#upload_manifest{
     Key = manifest_key(StreamId, Uid),
     Data = ?MANIFEST(Offset, Ts, NextOffset, Size, Entries),
     try
-        ?LOG_DEBUG("Uploading manifest for '~tp'", [StreamId]),
+        ?LOG_DEBUG("Uploading manifest for stream '~ts'", [StreamId]),
         {UploadMsec, ok} = timer:tc(
             fun() ->
                 ok = rabbitmq_stream_s3_api:put(Conn, Key, Data)
@@ -803,37 +805,91 @@ execute_task(#upload_manifest{
             millisecond
         ),
         ManifestSize = iolist_size(Data),
-        ?LOG_DEBUG("Uploaded manifest for '~tp' in ~b msec (~b bytes)", [
+        ?LOG_DEBUG("Uploaded manifest for stream '~ts' in ~b msec (~b bytes)", [
             StreamId, UploadMsec, ManifestSize
         ]),
         rabbitmq_stream_s3_counters:manifest_written(ManifestSize),
-        ok
+        case rabbitmq_stream_s3_db:put(StreamId, Reference, Epoch, ExpectedRevision, Uid) of
+            {ok, OldInfo, NewRevision} ->
+                case OldInfo of
+                    undefined ->
+                        ?LOG_DEBUG("Initial manifest created for stream '~ts' at epoch ~b", [
+                            StreamId, Epoch
+                        ]),
+                        ok;
+                    {OldUid, OldEpoch} ->
+                        ?LOG_DEBUG(
+                            "Manifest updated for stream '~ts', epoch ~b->~b, uid '~ts'->'~ts'", [
+                                StreamId,
+                                OldEpoch,
+                                Epoch,
+                                rabbitmq_stream_s3:format_uid(OldUid),
+                                rabbitmq_stream_s3:format_uid(Uid)
+                            ]
+                        ),
+                        OldKey = manifest_key(StreamId, OldUid),
+                        case rabbitmq_stream_s3_api:delete(Conn, OldKey) of
+                            ok ->
+                                ?LOG_DEBUG("Cleaned up old manifest with uid '~ts'", [
+                                    rabbitmq_stream_s3:format_uid(OldUid)
+                                ]),
+                                ok;
+                            {error, _} = Err ->
+                                ?LOG_DEBUG("Failed to clean up old manifest with uid '~ts': ~0p", [
+                                    rabbitmq_stream_s3:format_uid(OldUid), Err
+                                ]),
+                                ok
+                        end
+                end,
+                #manifest_uploaded{stream = StreamId, revision = NewRevision};
+            {error, {conflict, ExpectedRevision, ActualRevision}} ->
+                ?LOG_INFO(
+                    "An uploaded manifest was rejected by the metadata store's optimistic lock (expected ~b, actual ~b) '~ts'",
+                    [ExpectedRevision, ActualRevision, Key]
+                ),
+                #manifest_upload_rejected{
+                    stream = StreamId,
+                    expected = ExpectedRevision,
+                    actual = ActualRevision
+                };
+            {error, _} = Err ->
+                exit(Err)
+        end
     after
         ok = rabbitmq_stream_s3_api:close(Conn)
-    end,
-    #manifest_uploaded{stream = StreamId};
+    end;
 execute_task(#resolve_manifest{stream = StreamId}) ->
-    {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    Key = manifest_key(StreamId),
     Manifest0 =
-        try
-            case rabbitmq_stream_s3_api:get(Conn, Key) of
-                {ok, ?MANIFEST(FirstOffset, FirstTimestamp, NextOffset, TotalSize, Entries) = Data} ->
-                    rabbitmq_stream_s3_counters:manifest_read(byte_size(Data)),
-                    #manifest{
-                        first_offset = FirstOffset,
-                        first_timestamp = FirstTimestamp,
-                        next_offset = NextOffset,
-                        total_size = TotalSize,
-                        entries = Entries
-                    };
-                {error, not_found} ->
-                    #manifest{};
-                {error, _} = Err ->
-                    exit(Err)
-            end
-        after
-            ok = rabbitmq_stream_s3_api:close(Conn)
+        case rabbitmq_stream_s3_db:get(StreamId) of
+            {ok, #{uid := Uid, revision := Revision}} ->
+                Key = manifest_key(StreamId, Uid),
+                {ok, Conn} = rabbitmq_stream_s3_api:open(),
+                try
+                    case rabbitmq_stream_s3_api:get(Conn, Key) of
+                        {ok,
+                            ?MANIFEST(FirstOffset, FirstTimestamp, NextOffset, TotalSize, Entries) =
+                                Data} ->
+                            rabbitmq_stream_s3_counters:manifest_read(byte_size(Data)),
+                            #manifest{
+                                first_offset = FirstOffset,
+                                first_timestamp = FirstTimestamp,
+                                next_offset = NextOffset,
+                                total_size = TotalSize,
+                                revision = Revision,
+                                entries = Entries
+                            };
+                        {error, not_found} ->
+                            #manifest{};
+                        {error, _} = Err ->
+                            exit(Err)
+                    end
+                after
+                    ok = rabbitmq_stream_s3_api:close(Conn)
+                end;
+            {error, not_found} ->
+                #manifest{};
+            {error, _} = Err ->
+                exit(Err)
         end,
     #manifest_resolved{
         stream = StreamId,
