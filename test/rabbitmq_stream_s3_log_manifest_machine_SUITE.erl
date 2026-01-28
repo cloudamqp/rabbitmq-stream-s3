@@ -182,7 +182,8 @@ recover_uploaded_fragments(Config) ->
     %% The writer uploads fragments but the updated manifest is not yet
     %% uploaded. When restarting, the writer resolve the full manifest and
     %% upload it.
-    {Mac0, StreamId} = setup_writer(Config, ?MAC:new(#{debounce_modifications => 1})),
+    Cfg = #{debounce_modifications => 1},
+    {Mac0, StreamId} = setup_writer(Config, ?MAC:new(Cfg)),
     [F1, F2, _F3] = Fragments = [fragment(From, To) || {From, To} <- [{0, 19}, {20, 39}, {40, 59}]],
     FragmentsAvailable = [#fragment_available{stream = StreamId, fragment = F} || F <- Fragments],
     {Mac1, Effects1} = handle_events(?META(), FragmentsAvailable, Mac0),
@@ -230,7 +231,7 @@ recover_uploaded_fragments(Config) ->
         pid = Pid,
         dir = Dir
     },
-    {Mac4, Effects4} = ?MAC:apply(?META(), WriterSpawned, ?MAC:new()),
+    {Mac4, Effects4} = ?MAC:apply(?META(), WriterSpawned, ?MAC:new(Cfg)),
     ?assertMatch([#resolve_manifest{stream = StreamId}, #register_offset_listener{}], Effects4),
     %% The existing local fragments are sent to the manifest server as
     %% available.
@@ -499,7 +500,8 @@ backfill_older_segments(Config) ->
         dir = Dir,
         available_fragments = lists:reverse(Seg1Fragments)
     },
-    {Mac1, Effects1} = ?MAC:apply(?META(), WriterSpawned, ?MAC:new()),
+    Mac0 = ?MAC:new(#{debounce_modifications => 1}),
+    {Mac1, Effects1} = ?MAC:apply(?META(), WriterSpawned, Mac0),
     ?assertMatch([#resolve_manifest{}, #register_offset_listener{}], Effects1),
 
     %% All fragments will be committed as they arrive:

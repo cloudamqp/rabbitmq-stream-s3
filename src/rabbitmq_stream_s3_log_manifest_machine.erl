@@ -768,7 +768,7 @@ evaluate_upload(
         case Cfg of
             #{debounce_modifications := M} when Mods >= M ->
                 true;
-            #{debounce_milliseconds := Millis} when Millis > Ts - LastUploadTs andalso Mods > 0 ->
+            #{debounce_milliseconds := Millis} when Ts - LastUploadTs > Millis andalso Mods > 0 ->
                 true;
             _ ->
                 false
