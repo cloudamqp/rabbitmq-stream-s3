@@ -561,12 +561,12 @@ find_fragment_for_offset(Offset, #manifest{entries = Entries}, StreamId) ->
 find_fragment_for_offset(Offset, Entries, StreamId) ->
     RootIdx0 =
         rabbitmq_stream_s3_binary_array:partition_point(
-            fun(?ENTRY(O, _T, _K, _S, _N, _)) -> Offset > O end,
+            fun(?ENTRY(O, _T, _K, _S, _N, _U, _)) -> Offset > O end,
             ?ENTRY_B,
             Entries
         ),
     RootIdx = saturating_decr(RootIdx0),
-    ?ENTRY(EntryOffset, _, Kind, _, _, _) = rabbitmq_stream_s3_binary_array:at(
+    ?ENTRY(EntryOffset, _, Kind, _, _, Uid, _) = rabbitmq_stream_s3_binary_array:at(
         RootIdx, ?ENTRY_B, Entries
     ),
     ?LOG_DEBUG("partition-point ~b for offset ~b is entry ~b", [
@@ -613,8 +613,9 @@ find_fragment_for_offset(Offset, Entries, StreamId) ->
                 _:64,
                 0:2/unsigned,
                 _:70,
+                Uid:8/binary,
                 GroupEntries/binary
-            >> = get_group(StreamId, Kind, EntryOffset),
+            >> = get_group(StreamId, Uid, Kind, EntryOffset),
             find_fragment_for_offset(Offset, GroupEntries, StreamId)
     end.
 
@@ -637,9 +638,9 @@ index_data(StreamId, FragmentOffset, StartPos) ->
         ok = rabbitmq_stream_s3_api:close(Conn)
     end.
 
-get_group(StreamId, Kind, GroupOffset) ->
+get_group(StreamId, Uid, Kind, GroupOffset) ->
     {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    Key = rabbitmq_stream_s3_log_manifest:group_key(StreamId, Kind, GroupOffset),
+    Key = rabbitmq_stream_s3_log_manifest:group_key(StreamId, Uid, Kind, GroupOffset),
     ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
     try
         {ok, Data} = rabbitmq_stream_s3_api:get(Conn, Key, #{timeout => ?READ_TIMEOUT}),

@@ -351,7 +351,15 @@ retention(Config) ->
 
     Ts = erlang:system_time(millisecond),
     Entries = <<
-        ?ENTRY((N * 20), (Ts - 100 + N * 20), ?MANIFEST_KIND_FRAGMENT, 200, N, <<>>)
+        ?ENTRY(
+            (N * 20),
+            (Ts - 100 + N * 20),
+            ?MANIFEST_KIND_FRAGMENT,
+            200,
+            N,
+            rabbitmq_stream_s3:null_uid(),
+            <<>>
+        )
      || N <- lists:seq(0, 4)
     >>,
     Manifest = #manifest{
@@ -605,7 +613,9 @@ fragments_to_manifest([
         next_offset = NextOffset,
         first_timestamp = Ts,
         total_size = Size,
-        entries = ?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, <<>>)
+        entries = ?ENTRY(
+            Offset, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, rabbitmq_stream_s3:null_uid(), <<>>
+        )
     }).
 
 fragments_to_manifest([], Manifest) ->
@@ -628,7 +638,15 @@ fragments_to_manifest(
         total_size = TotalSize0 + Size,
         entries =
             <<Entries0/binary,
-                (?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, <<>>))/binary>>
+                (?ENTRY(
+                    Offset,
+                    Ts,
+                    ?MANIFEST_KIND_FRAGMENT,
+                    Size,
+                    SeqNo,
+                    rabbitmq_stream_s3:null_uid(),
+                    <<>>
+                ))/binary>>
     },
     fragments_to_manifest(Rest, Manifest).
 

@@ -80,7 +80,7 @@
 -export([get_manifest/1, get_fragment_trailer/1, get_fragment_trailer/2]).
 
 %% Useful to search module.
--export([fragment_key/2, group_key/3, make_file_name/2, fragment_trailer_to_info/1]).
+-export([fragment_key/2, group_key/4, make_file_name/2, fragment_trailer_to_info/1]).
 
 %% This server needs to be started by a boot step so that it is online before
 %% the stream coordinator. Otherwise the stream coordinator will attempt to
@@ -539,18 +539,27 @@ format_osiris_event(Event) ->
 make_file_name(Offset, Suffix) when is_integer(Offset) andalso is_binary(Suffix) ->
     <<(iolist_to_binary(io_lib:format("~20..0B", [Offset])))/binary, ".", Suffix/binary>>.
 
--spec manifest_key(stream_id()) -> rabbitmq_stream_s3_api:key().
-manifest_key(StreamId) when is_binary(StreamId) ->
-    manifest_key(StreamId, <<"manifest">>).
+-spec manifest_key(stream_id(), rabbitmq_stream_s3:uid()) -> rabbitmq_stream_s3_api:key().
+manifest_key(StreamId, Uid) when is_binary(StreamId) andalso is_binary(Uid) ->
+    manifest_key(StreamId, Uid, <<"manifest">>).
 
--spec manifest_key(stream_id(), filename()) -> rabbitmq_stream_s3_api:key().
-manifest_key(StreamId, Filename) when is_binary(StreamId) andalso is_binary(Filename) ->
-    <<"rabbitmq/stream/", StreamId/binary, "/metadata/", Filename/binary>>.
+-spec manifest_key(stream_id(), rabbitmq_stream_s3:uid(), filename()) ->
+    rabbitmq_stream_s3_api:key().
+manifest_key(StreamId, Uid, Filename) when
+    is_binary(StreamId) andalso is_binary(Uid) andalso is_binary(Filename)
+->
+    <<"rabbitmq/stream/", StreamId/binary, "/metadata/",
+        (rabbitmq_stream_s3:format_uid(Uid))/binary, $., Filename/binary>>.
 
--spec group_key(stream_id(), rabbitmq_stream_s3_log_manifest_entry:kind(), osiris:offset()) ->
-    binary().
-group_key(StreamId, Kind, Offset) ->
-    manifest_key(StreamId, make_file_name(Offset, group_extension(Kind))).
+-spec group_key(
+    stream_id(),
+    rabbitmq_stream_s3:uid(),
+    rabbitmq_stream_s3_log_manifest_entry:kind(),
+    osiris:offset()
+) ->
+    rabbitmq_stream_s3_api:key().
+group_key(StreamId, Uid, Kind, Offset) ->
+    manifest_key(StreamId, Uid, make_file_name(Offset, group_extension(Kind))).
 
 -spec stream_data_key(stream_id(), filename()) -> rabbitmq_stream_s3_api:key().
 stream_data_key(StreamId, Filename) when is_binary(StreamId) andalso is_binary(Filename) ->
@@ -734,8 +743,8 @@ execute_task(#rebalance_manifest{
     manifest = Manifest0
 }) ->
     Ext = group_extension(GroupKind),
-    ?ENTRY(GroupOffset, Ts, _, _, _, _) = GroupEntries,
-    Key = manifest_key(StreamId, make_file_name(GroupOffset, group_extension(GroupKind))),
+    ?ENTRY(GroupOffset, Ts, _, _, _, Uid, _) = GroupEntries,
+    Key = manifest_key(StreamId, Uid, make_file_name(GroupOffset, group_extension(GroupKind))),
     Data = [
         group_header(GroupKind),
         <<GroupOffset:64/unsigned, Ts:64/signed, 0:2/signed, GroupSize:70/unsigned>>,
@@ -774,9 +783,9 @@ execute_task(#upload_manifest{
     }
 }) ->
     {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    Key = manifest_key(StreamId),
-    Data = [?MANIFEST(Offset, Ts, NextOffset, Size, <<>>), Entries],
-
+    Uid = rabbitmq_stream_s3:uid(),
+    Key = manifest_key(StreamId, Uid),
+    Data = ?MANIFEST(Offset, Ts, NextOffset, Size, Entries),
     try
         ?LOG_DEBUG("Uploading manifest for '~tp'", [StreamId]),
         {UploadMsec, ok} = timer:tc(
@@ -875,7 +884,15 @@ resolve_manifest_tail(
         }} ->
             Entries =
                 <<Entries0/binary,
-                    (?ENTRY(NextOffset0, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, <<>>))/binary>>,
+                    (?ENTRY(
+                        NextOffset0,
+                        Ts,
+                        ?MANIFEST_KIND_FRAGMENT,
+                        Size,
+                        SeqNo,
+                        rabbitmq_stream_s3:uid(),
+                        <<>>
+                    ))/binary>>,
             Manifest = Manifest0#manifest{
                 next_offset = NextOffset,
                 total_size = TotalSize0 + Size,

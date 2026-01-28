@@ -32,14 +32,20 @@ Returns the combined size of all entries in the array.
 -spec total_size(entries()) -> non_neg_integer().
 total_size(Entries) when is_binary(Entries) ->
     rabbitmq_stream_s3_binary_array:fold(
-        fun(?ENTRY(_O, _T, _K, S, _N, _), Acc) -> S + Acc end,
+        fun(?ENTRY(_O, _T, _K, S, _N, _U, _), Acc) -> S + Acc end,
         0,
         ?ENTRY_B,
         Entries
     ).
 
 -spec rebalance(entries()) ->
-    {kind(), TotalSize :: non_neg_integer(), NewGroup :: entries(), Rebalanced :: entries()}
+    {
+        rabbitmq_stream_s3:uid(),
+        kind(),
+        TotalSize :: non_neg_integer(),
+        NewGroup :: entries(),
+        Rebalanced :: entries()
+    }
     | undefined.
 rebalance(Entries) ->
     rebalance(Entries, 0).
@@ -47,7 +53,9 @@ rebalance(Entries) ->
 rebalance(Entries0, Idx) when
     byte_size(Entries0) - (Idx * ?ENTRY_B) >= (?MANIFEST_BRANCHING_FACTOR * ?ENTRY_B)
 ->
-    ?ENTRY(Offset, Ts, Kind, _, _, _) = rabbitmq_stream_s3_binary_array:at(Idx, ?ENTRY_B, Entries0),
+    ?ENTRY(Offset, Ts, Kind, _, _, _, _) = rabbitmq_stream_s3_binary_array:at(
+        Idx, ?ENTRY_B, Entries0
+    ),
     ?LOG_DEBUG("Considering grouping of kind ~b at idx ~b (~b bytes remaining)", [
         Kind, Idx, byte_size(Entries0) - (Idx * ?ENTRY_B)
     ]),
@@ -56,7 +64,7 @@ rebalance(Entries0, Idx) when
     %% group.
     GroupEndIdx = Idx + ?MANIFEST_BRANCHING_FACTOR - 1,
     case rabbitmq_stream_s3_binary_array:at(GroupEndIdx, ?ENTRY_B, Entries0) of
-        ?ENTRY(_, _, Kind, _, _, _) ->
+        ?ENTRY(_, _, Kind, _, _, _, _) ->
             %% If the kind is the same, this chunk of entries can be compacted
             %% into a group.
             ?LOG_DEBUG("Found full group of kind ~b at idx ~b", [Kind, Idx]),
@@ -65,16 +73,17 @@ rebalance(Entries0, Idx) when
             Len = ?MANIFEST_BRANCHING_FACTOR * ?ENTRY_B,
             GroupEntries = binary:part(Entries0, Pos, Len),
             GroupSize = total_size(GroupEntries),
+            GroupUid = rabbitmq_stream_s3:uid(),
             Entries = <<
                 %% From the beginning to the start of the compacted entries:
                 (binary:part(Entries0, 0, Pos))/binary,
                 %% Replace the new group's entries with the newly created group:
-                (?ENTRY(Offset, Ts, GroupKind, GroupSize, 0, <<>>))/binary,
+                (?ENTRY(Offset, Ts, GroupKind, GroupSize, 0, GroupUid, <<>>))/binary,
                 %% And finally include the trailing entries which come after
                 %% the new group entries.
                 (binary:part(Entries0, Pos + Len, byte_size(Entries0) - Pos - Len))/binary
             >>,
-            {GroupKind, GroupSize, GroupEntries, Entries};
+            {GroupUid, GroupKind, GroupSize, GroupEntries, Entries};
         _ ->
             case find_next_smallest_kind(Kind, Entries0) of
                 Idx ->
@@ -96,7 +105,7 @@ rebalance(_, _Pos) ->
 -spec find_next_smallest_kind(kind(), entries()) -> index().
 find_next_smallest_kind(Kind, Entries0) ->
     rabbitmq_stream_s3_binary_array:partition_point(
-        fun(?ENTRY(_, _, K, _, _, _)) -> Kind =< K end, ?ENTRY_B, Entries0
+        fun(?ENTRY(_, _, K, _, _, _, _)) -> Kind =< K end, ?ENTRY_B, Entries0
     ).
 
 next_group(?MANIFEST_KIND_FRAGMENT) -> ?MANIFEST_KIND_GROUP;

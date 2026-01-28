@@ -136,17 +136,23 @@
     %% Entries array:
     Entries/binary
 >>).
--define(ENTRY(Offset, Timestamp, Kind, Size, SeqNo, Rest), <<
+-define(ENTRY(Offset, Timestamp, Kind, Size, SeqNo, Uid, Rest), <<
     Offset:64/unsigned,
     Timestamp:64/signed,
     Kind:2/unsigned,
     Size:70/unsigned,
     SeqNo:16/unsigned,
+    (Uid):8/binary,
     %% Other entries:
     Rest/binary
 >>).
-%% offset (8) + timestamp (8) + kind/size (9) + seq no (2) = 27
--define(ENTRY_B, 27).
+%% * offset(8)
+%% * timestamp (8)
+%% * kind/size (9)
+%% * seq no (2)
+%% * uid (8)
+%% = 35
+-define(ENTRY_B, 35).
 
 %% A nicer version of the above `?MANIFEST/5' macro. This is the root of the
 %% manifest. A newly created, empty manifest can be identified by checking

@@ -511,7 +511,15 @@ apply_infos(
         total_size = TotalSize0 + Size,
         entries =
             <<Entries0/binary,
-                ?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, <<>>)/binary>>
+                ?ENTRY(
+                    Offset,
+                    Ts,
+                    ?MANIFEST_KIND_FRAGMENT,
+                    Size,
+                    SeqNo,
+                    rabbitmq_stream_s3:null_uid(),
+                    <<>>
+                )/binary>>
     },
     apply_infos(Rest, Manifest);
 apply_infos([Info | _], #manifest{}) ->
@@ -657,7 +665,7 @@ evaluate_retention(
     case ExceedsRetention of
         true ->
             case Entries0 of
-                ?ENTRY(_Offset, _Timestamp, ?MANIFEST_KIND_FRAGMENT, _Size, _SeqNo, _Rest) ->
+                ?ENTRY(_Offset, _Timestamp, ?MANIFEST_KIND_FRAGMENT, _Size, _SeqNo, _Uid, _Rest) ->
                     %% In the common case a stream will not be so long that it
                     %% needs groups. Luckily, this means we can determine
                     %% which fragments can be deleted very efficiently by
@@ -688,7 +696,7 @@ evaluate_retention1(Manifest, Now, RetentionSpec) ->
 evaluate_retention1(
     #manifest{
         total_size = TotalSize0,
-        entries = ?ENTRY(Offset, _Ts, Kind, Size, _SeqNo, Rest)
+        entries = ?ENTRY(Offset, _Ts, Kind, Size, _SeqNo, _Uid, Rest)
     } = Manifest0,
     Now,
     #{max_bytes := MaxBytes} = Spec,
@@ -703,7 +711,7 @@ evaluate_retention1(
 evaluate_retention1(
     #manifest{
         total_size = TotalSize0,
-        entries = ?ENTRY(Offset, Ts, Kind, Size, _SeqNo, Rest)
+        entries = ?ENTRY(Offset, Ts, Kind, Size, _SeqNo, _Uid, Rest)
     } = Manifest0,
     Now,
     #{max_age := MaxAge} = Spec,
@@ -716,7 +724,7 @@ evaluate_retention1(
     },
     evaluate_retention1(Manifest, Now, Spec, [Offset | Offsets0]);
 evaluate_retention1(#manifest{entries = Entries} = Manifest0, _Now, _Spec, Offsets) ->
-    ?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, _Size, _SeqNo, _Rest) = Entries,
+    ?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, _Size, _SeqNo, _Uid, _Rest) = Entries,
     Manifest = Manifest0#manifest{
         first_offset = Offset,
         first_timestamp = Ts
@@ -886,7 +894,15 @@ apply_infos_test() ->
 evaluate_retention1_test() ->
     Ts = erlang:system_time(millisecond),
     Entries = <<
-        ?ENTRY((N * 20), (Ts - 100 + N * 20), ?MANIFEST_KIND_FRAGMENT, 200, N, <<>>)
+        ?ENTRY(
+            (N * 20),
+            (Ts - 100 + N * 20),
+            ?MANIFEST_KIND_FRAGMENT,
+            200,
+            N,
+            rabbitmq_stream_s3:null_uid(),
+            <<>>
+        )
      || N <- lists:seq(0, 4)
     >>,
     Manifest = #manifest{
