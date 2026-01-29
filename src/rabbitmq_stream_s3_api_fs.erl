@@ -136,9 +136,13 @@ delete(Connection, Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
       FragmentFile :: binary().
 get_stream_data(StreamName0) ->
     StreamNameWildcard = binary_to_list(<<"*", StreamName0/binary, "*">>),
-    case filelib:wildcard(string:join([?STORAGE_DIR,"**", StreamNameWildcard, "**", "*manifest"], "/")) of
+    case filelib:wildcard(string:join([?STORAGE_DIR, "**", StreamNameWildcard], "/")) of
         [] -> {error, not_found};
-        [Manifest] ->
+        [StreamDir] ->
+            Manifest = case filelib:wildcard(string:join([StreamDir, "**", "*manifest"], "/")) of
+                [] -> undefined;
+                [ManifestFile] -> ManifestFile
+            end,
             Fragments = filelib:wildcard(string:join([?STORAGE_DIR,
                                                       "**",
                                                       StreamNameWildcard,
