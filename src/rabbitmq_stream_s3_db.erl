@@ -24,6 +24,7 @@ writer cannot make progress anymore.
 -include_lib("kernel/include/logger.hrl").
 -include_lib("khepri/include/khepri.hrl").
 -include_lib("rabbit/include/rabbit_khepri.hrl").
+-include_lib("rabbit_common/include/resource.hrl").
 
 -define(PATH(StreamId), ?RABBITMQ_KHEPRI_ROOT_PATH([rabbitmq_stream_s3, StreamId])).
 

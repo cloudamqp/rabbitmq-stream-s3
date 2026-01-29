@@ -1,8 +1,6 @@
 %% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 %% SPDX-License-Identifier: Apache-2.0
 
--include_lib("rabbit_common/include/resource.hrl").
-
 %% A logical identifier for a stream. This is set to be the stream queue's
 %% resource name by RabbitMQ. This term is used for the `{osiris_offset,
 %% stream_reference(), osiris:offset()}' message sent by Osiris and to trigger
