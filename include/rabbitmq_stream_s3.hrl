@@ -255,7 +255,7 @@
 }).
 -record(manifest_uploaded, {
     stream :: stream_id(),
-    revision :: rabbitmq_stream_s3_db:revision()
+    entry :: rabbitmq_stream_s3_db:entry()
 }).
 -record(manifest_rebalanced, {
     stream :: stream_id(),
@@ -301,9 +301,9 @@
 }).
 -record(manifest_upload_rejected, {
     stream :: stream_id(),
-    expected :: rabbitmq_stream_s3_db:revision(),
-    actual :: rabbitmq_stream_s3_db:revision()
+    conflict :: rabbitmq_stream_s3_db:entry()
 }).
+-record(stream_deleted, {stream :: stream_id()}).
 
 -type event() ::
     #acceptor_spawned{}
@@ -317,6 +317,7 @@
     | #manifest_upload_rejected{}
     | #manifest_uploaded{}
     | #retention_updated{}
+    | #stream_deleted{}
     | #tick{}
     | #writer_spawned{}.
 
