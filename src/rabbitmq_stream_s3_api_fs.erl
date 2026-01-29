@@ -161,7 +161,7 @@ with_timeout(Timeout, Fun) ->
         Timeout ->
             ?LOG_INFO(?MODULE_STRING ": operation timeouted"),
             exit(Pid, kill),
-            {error, timout}
+            {error, timeout}
     end.
 
 range_spec_to_location_number(FileSize, SuffixRange) when is_integer(SuffixRange), SuffixRange < 0 ->

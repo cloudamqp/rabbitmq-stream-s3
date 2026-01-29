@@ -93,11 +93,6 @@ publish_consume(Config) ->
     % be cleared out.
     amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
 
-    % ?awaitMatch({error, not_found}, rabbit_ct_broker_helpers:rpc(Config, 0,
-    %                                         rabbitmq_stream_s3_api_fs,
-    %                                         get_stream_data, [QName]),
-    %             5000),
-
     rabbit_ct_client_helpers:close_channel(Ch),
     ok.
 
