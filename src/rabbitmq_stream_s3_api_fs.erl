@@ -63,15 +63,14 @@ close(_Connection) ->
     {ok, binary()} | {error, any()}.
 get(Connection, Key, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
-    Self = self(),
     with_timeout(Timeout, fun() ->
         ?LOG_INFO("Trying to find file ~p in : ~p", [Key, Connection]),
         FilePath = filename:join(Connection, Key),
         case filelib:wildcard(binary_to_list(FilePath)) of
             [Filename] ->
-                Self ! {self(), {ok, file:read_file(Filename)}};
+                {ok, file:read_file(Filename)};
             [] ->
-                Self ! {self(), {error, not_found}}
+                {error, not_found}
         end
     end).
 
@@ -79,7 +78,6 @@ get(Connection, Key, Opts) ->
     {ok, binary()} | {error, any()}.
 get_range(Connection, Key, RangeSpec, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
-    Self = self(),
     with_timeout(Timeout, fun() ->
         FilePath = filename:join(Connection, Key),
         case filelib:wildcard(binary_to_list(FilePath)) of
@@ -89,9 +87,9 @@ get_range(Connection, Key, RangeSpec, Opts) ->
                 {Location, Number} = range_spec_to_location_number(FileSize, RangeSpec),
                 {ok, Data} = file:pread(Fd, Location, Number),
                 file:close(Fd),
-                Self ! {self(), {ok, Data}};
+                {ok, Data};
             [] ->
-                Self ! {self(), {error, not_found}}
+                {error, not_found}
         end
     end).
 
@@ -99,14 +97,13 @@ get_range(Connection, Key, RangeSpec, Opts) ->
     ok | {error, any()}.
 put(Connection, Key, Data, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
-    Self = self(),
     with_timeout(Timeout, fun() ->
         ?LOG_INFO("Writing file ~p in : ~p", [Key, Connection]),
         FilePath = filename:join(Connection, Key),
         filelib:ensure_path(filename:dirname(FilePath)),
         Result = file:write_file(FilePath, Data),
         ?LOG_INFO("Write result: ~p", [Result]),
-        Self ! {self(), Result}
+        Result
     end).
 
 -spec delete(connection(), key() | [key()], rabbitmq_stream_s3_api:request_opts()) ->
@@ -115,7 +112,6 @@ delete(Connection, Key, Opts) when is_binary(Key) andalso is_map(Opts) ->
     delete(Connection, [Key], Opts);
 delete(Connection, Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
-    Self = self(),
     with_timeout(Timeout, fun() ->
         Result = lists:filtermap(
                     fun (K) ->
@@ -126,8 +122,8 @@ delete(Connection, Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
                     end,
                     Keys),
         case Result of
-            [] -> Self ! {self(), ok};
-            _ -> Self ! {self(), {error, Result}}
+            [] -> ok;
+            _ -> {error, Result}
         end
     end).
 
@@ -158,7 +154,8 @@ clear() ->
 
 
 with_timeout(Timeout, Fun) ->
-    Pid = spawn(Fun),
+    Self = self(),
+    Pid = spawn(fun() -> Self ! {self(), Fun()} end),
     receive
         {Pid, Result} -> Result
     after
