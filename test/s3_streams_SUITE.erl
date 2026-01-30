@@ -33,7 +33,8 @@ init_per_suite(Config) ->
                 {log_manifest, rabbitmq_stream_s3_log_manifest}
             ]},
             {rabbitmq_stream_s3, [
-                {rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fs}
+                {rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fs},
+                {manifest_debounce_modifications, 1}
             ]},
             {rabbit, [
                 {max_message_size, 134217728}
@@ -110,7 +111,7 @@ publish_consume(Config) ->
 
     % One fragment should exist
     ?awaitMatch(
-        {ok, _Manifest, [_Fragment]},
+        {ok, Manifest, [_Fragment]} when Manifest /= undefined,
         rabbit_ct_broker_helpers:rpc(
             Config,
             0,
