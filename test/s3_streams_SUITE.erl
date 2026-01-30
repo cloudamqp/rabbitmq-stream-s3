@@ -56,6 +56,15 @@ end_per_suite(Config) ->
     ).
 
 init_per_testcase(Testcase, Config) ->
+    BasePart = rabbit_ct_helpers:get_config(Config, priv_dir),
+    TestcasePart = rabbit_ct_helpers:config_to_testcase_name(Config, Testcase),
+    rabbit_ct_broker_helpers:rpc(
+        Config,
+        0,
+        rabbitmq_stream_s3_api_fs,
+        set_data_dir,
+        [filename:join([BasePart, "s3_api_fs_storage", TestcasePart])]
+    ),
     rabbit_ct_helpers:testcase_started(Config, Testcase).
 
 end_per_testcase(Testcase, Config) ->

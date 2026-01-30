@@ -25,13 +25,12 @@ associated file in that folder.
 % Auxiliary function for thesting
 -export([
     get_stream_data/1,
-    clear/0
+    clear/0,
+    set_data_dir/1
 ]).
 
 
 -behaviour(rabbitmq_stream_s3_api).
-
--define(STORAGE_DIR, filename:join([rabbit:data_dir(), atom_to_list(?MODULE)])).
 
 -type connection() :: rabbitmq_stream_s3_api:connection().
 -type key() :: rabbitmq_stream_s3_api:key().
@@ -52,7 +51,7 @@ init() ->
 -spec open() -> {ok, connection()} | {error, any()}.
 open() ->
     ?LOG_INFO(?MODULE_STRING ": opening connection"),
-    {ok, ?STORAGE_DIR}.
+    {ok, ok}.
 
 -spec close(connection()) -> ok.
 close(_Connection) ->
@@ -61,11 +60,11 @@ close(_Connection) ->
 
 -spec get(connection(), key(), rabbitmq_stream_s3_api:request_opts()) ->
     {ok, binary()} | {error, any()}.
-get(Connection, Key, Opts) ->
+get(_Connection, Key, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     with_timeout(Timeout, fun() ->
-        ?LOG_INFO("Trying to find file ~p in : ~p", [Key, Connection]),
-        FilePath = filename:join(Connection, Key),
+        ?LOG_INFO("Trying to find file ~p in : ~p", [Key, data_dir()]),
+        FilePath = key_to_path(Key),
         case filelib:wildcard(binary_to_list(FilePath)) of
             [Filename] ->
                 {ok, file:read_file(Filename)};
@@ -76,10 +75,10 @@ get(Connection, Key, Opts) ->
 
 -spec get_range(connection(), key(), rabbitmq_stream_s3_api:range_spec(), rabbitmq_stream_s3_api:request_opts()) ->
     {ok, binary()} | {error, any()}.
-get_range(Connection, Key, RangeSpec, Opts) ->
+get_range(_Connection, Key, RangeSpec, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     with_timeout(Timeout, fun() ->
-        FilePath = filename:join(Connection, Key),
+        FilePath = key_to_path(Key),
         case filelib:wildcard(binary_to_list(FilePath)) of
             [Filename] ->
                 #file_info{size=FileSize} = file:read_file_info(Filename),
@@ -95,11 +94,11 @@ get_range(Connection, Key, RangeSpec, Opts) ->
 
 -spec put(connection(), key(), iodata(), rabbitmq_stream_s3_api:request_opts()) ->
     ok | {error, any()}.
-put(Connection, Key, Data, Opts) ->
+put(_Connection, Key, Data, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     with_timeout(Timeout, fun() ->
-        ?LOG_INFO("Writing file ~p in : ~p", [Key, Connection]),
-        FilePath = filename:join(Connection, Key),
+        ?LOG_INFO("Writing file ~p in : ~p", [Key, data_dir()]),
+        FilePath = key_to_path(Key),
         filelib:ensure_path(filename:dirname(FilePath)),
         Result = file:write_file(FilePath, Data),
         ?LOG_INFO("Write result: ~p", [Result]),
@@ -110,12 +109,12 @@ put(Connection, Key, Data, Opts) ->
     ok | {error, any()}.
 delete(Connection, Key, Opts) when is_binary(Key) andalso is_map(Opts) ->
     delete(Connection, [Key], Opts);
-delete(Connection, Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
+delete(_Connection, Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     with_timeout(Timeout, fun() ->
         Result = lists:filtermap(
                     fun (K) ->
-                        case file:delete(filename:join(Connection, K)) of
+                        case file:delete(key_to_path(K)) of
                             ok -> false;
                             Error -> {true, {K, Error}}
                         end
@@ -132,14 +131,14 @@ delete(Connection, Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
       FragmentFile :: binary().
 get_stream_data(StreamName0) ->
     StreamNameWildcard = binary_to_list(<<"*", StreamName0/binary, "*">>),
-    case filelib:wildcard(string:join([?STORAGE_DIR, "**", StreamNameWildcard], "/")) of
+    case filelib:wildcard(string:join([data_dir(), "**", StreamNameWildcard], "/")) of
         [] -> {error, not_found};
         [StreamDir] ->
             Manifest = case filelib:wildcard(string:join([StreamDir, "**", "*manifest"], "/")) of
                 [] -> undefined;
                 [ManifestFile] -> ManifestFile
             end,
-            Fragments = filelib:wildcard(string:join([?STORAGE_DIR,
+            Fragments = filelib:wildcard(string:join([data_dir(),
                                                       "**",
                                                       StreamNameWildcard,
                                                       "**",
@@ -150,8 +149,20 @@ get_stream_data(StreamName0) ->
 
 -spec clear() -> ok | {error, any()}.
 clear() ->
-    file:del_dir_r(?STORAGE_DIR).
+    file:del_dir_r(data_dir()).
 
+-spec set_data_dir(string()) -> ok.
+set_data_dir(DataDir) ->
+    application:set_env(rabbitmq_stream_s3, api_fs_data_dir, DataDir).
+
+-spec data_dir() -> binary().
+data_dir() ->
+    {ok, Dir} = application:get_env(rabbitmq_stream_s3, api_fs_data_dir),
+    Dir.
+
+-spec key_to_path(rabbitmq_stream_s3_api:key()) -> binary().
+key_to_path(Key) ->
+    filename:join(data_dir(), Key).
 
 with_timeout(Timeout, Fun) ->
     Self = self(),
