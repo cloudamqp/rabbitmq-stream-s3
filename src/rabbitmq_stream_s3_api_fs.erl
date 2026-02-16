@@ -38,13 +38,7 @@ associated file in that folder.
 -spec init() -> ok.
 init() ->
     ?LOG_INFO(?MODULE_STRING ": initializing"),
-    case ets:whereis(?MODULE) of
-        undefined ->
-            ets:new(?MODULE, [named_table, public, set]),
-            ok;
-        _ ->
-            ok
-    end.
+    ok.
 
 -doc """
 """.
@@ -68,10 +62,10 @@ get(_Connection, Key, Opts) ->
             {error, path_not_set} = E ->
                 E;
             FilePath ->
-                case filelib:wildcard(binary_to_list(FilePath)) of
-                    [Filename] ->
-                        file:read_file(Filename);
-                    [] ->
+                case file:read_file(binary_to_list(FilePath)) of
+                    {ok, _} = Result ->
+                        Result;
+                    {error, enoent} ->
                         {error, not_found}
                 end
         end
@@ -86,10 +80,10 @@ get_range(_Connection, Key, RangeSpec, Opts) ->
             {error, path_not_set} = E ->
                 E;
             FilePath ->
-                case filelib:wildcard(binary_to_list(FilePath)) of
-                    [Filename] ->
-                        {ok, #file_info{size=FileSize}} = file:read_file_info(Filename),
-                        {ok, Fd} = file:open(Filename, [read, binary]),
+                FilePathBin = binary_to_list(FilePath),
+                case file:read_file_info(FilePathBin) of
+                    {ok, #file_info{size=FileSize}} ->
+                        {ok, Fd} = file:open(FilePathBin, [read, binary]),
                         {Location, Number} = range_spec_to_location_number(FileSize, RangeSpec),
                         Result = case file:pread(Fd, Location, Number) of
                             {ok, Data} ->
@@ -97,9 +91,9 @@ get_range(_Connection, Key, RangeSpec, Opts) ->
                             eof ->
                                 {ok, <<>>}
                         end,
-                        file:close(Fd),
+                        ok = file:close(Fd),
                         Result;
-                    [] ->
+                    {error, enoent} ->
                         {error, not_found}
                 end
         end
@@ -115,7 +109,7 @@ put(_Connection, Key, Data, Opts) ->
             {error, path_not_set} = E ->
                 E;
             FilePath ->
-                filelib:ensure_path(filename:dirname(FilePath)),
+                ok = filelib:ensure_path(filename:dirname(FilePath)),
                 Result = file:write_file(FilePath, Data),
                 ?LOG_INFO("Write result: ~p", [Result]),
                 Result
@@ -148,25 +142,33 @@ delete(_Connection, Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
         end
     end).
 
--spec get_stream_data(StreamName) -> {ok, [FragmentFile]} | {error, not_found} when
+-spec get_stream_data(StreamName) -> {ok, Manifest, [FragmentFile]} | {error, not_found | path_not_set} when
       StreamName :: binary(),
-      FragmentFile :: binary().
+      Manifest :: Path | undefined,
+      FragmentFile :: Path,
+      Path :: binary().
 get_stream_data(StreamName0) ->
-    StreamNameWildcard = binary_to_list(<<"*", StreamName0/binary, "*">>),
-    case filelib:wildcard(string:join([data_dir(), "**", StreamNameWildcard], "/")) of
-        [] -> {error, not_found};
-        [StreamDir] ->
-            Manifest = case filelib:wildcard(string:join([StreamDir, "**", "*manifest"], "/")) of
-                [] -> undefined;
-                [ManifestFile] -> ManifestFile
-            end,
-            Fragments = filelib:wildcard(string:join([data_dir(),
-                                                      "**",
-                                                      StreamNameWildcard,
-                                                      "**",
-                                                      "*.fragment"],
-                                                     "/")),
-            {ok, Manifest, Fragments}
+    case data_dir() of
+        undefined ->
+            {error, path_not_set};
+        DataDir ->
+            StreamNameWildcard = binary_to_list(<<"*", StreamName0/binary, "*">>),
+            case filelib:wildcard(string:join([DataDir, "**", StreamNameWildcard], "/")) of
+                [] ->
+                    {error, not_found};
+                [StreamDir | _] ->
+                    Manifest = case filelib:wildcard(string:join([StreamDir, "**", "*manifest"], "/")) of
+                        [] -> undefined;
+                        [ManifestFile | _] -> ManifestFile
+                    end,
+                    Fragments = filelib:wildcard(string:join([DataDir,
+                                                              "**",
+                                                              StreamNameWildcard,
+                                                              "**",
+                                                              "*.fragment"],
+                                                             "/")),
+                    {ok, Manifest, Fragments}
+            end
     end.
 
 -spec clear() -> ok | {error, any()}.
@@ -177,11 +179,11 @@ clear() ->
 set_data_dir(DataDir) ->
     application:set_env(rabbitmq_stream_s3, api_fs_data_dir, DataDir).
 
--spec data_dir() -> binary().
+-spec data_dir() -> binary() | undefined.
 data_dir() ->
     application:get_env(rabbitmq_stream_s3, api_fs_data_dir, undefined).
 
--spec key_to_path(rabbitmq_stream_s3_api:key()) -> {ok, binary()} | {error, path_not_set}.
+-spec key_to_path(rabbitmq_stream_s3_api:key()) -> binary() | {error, path_not_set}.
 key_to_path(Key) ->
     case data_dir() of
         undefined -> {error, path_not_set};
