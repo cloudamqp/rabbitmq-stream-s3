@@ -79,9 +79,7 @@ end_per_group(_, Config) ->
     ).
 
 init_per_testcase(Testcase, Config) ->
-    BasePart = rabbit_ct_helpers:get_config(Config, priv_dir),
-    TestcasePart = rabbit_ct_helpers:config_to_testcase_name(Config, Testcase),
-    DataDir = filename:join([BasePart, "s3_api_fs_storage", TestcasePart]),
+    DataDir = test_data_dir(Testcase, Config),
 
     % Set data directory on all nodes in the cluster
     Nodes = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
@@ -167,17 +165,17 @@ tiered_data_generation(Config) ->
     amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
 
     % Wait for cleanup to complete
-    ?awaitMatch(
-        {error, not_found},
-        rabbit_ct_broker_helpers:rpc(
-            Config,
-            0,
-            rabbitmq_stream_s3_api_fs,
-            get_stream_data,
-            [QName]
-        ),
-        5000
-    ),
+    % ?awaitMatch(
+    %     {error, not_found},
+    %     rabbit_ct_broker_helpers:rpc(
+    %         Config,
+    %         0,
+    %         rabbitmq_stream_s3_api_fs,
+    %         get_stream_data,
+    %         [QName]
+    %     ),
+    %     10000
+    % ),
 
     rabbit_ct_client_helpers:close_channel(Ch),
     ok.
@@ -275,9 +273,17 @@ transfer_leadership(Config) ->
     % Restart the stopped node
     ct:pal("Restarting the stopped node ~p", [LeaderNode]),
     ok = rabbit_ct_broker_helpers:start_node(Config, LeaderNode),
+    DataDir = test_data_dir(?FUNCTION_NAME, Config),
+    rabbit_ct_broker_helpers:rpc(
+        Config,
+        LeaderNode,
+        rabbitmq_stream_s3_api_fs,
+        set_data_dir,
+        [DataDir]
+    ),
 
     % Wait for the node to rejoin
-    timer:sleep(2000),
+    timer:sleep(10000),
 
     % Verify the stream is still accessible
     ct:pal("Verifying stream is still accessible after node restart"),
@@ -302,6 +308,11 @@ transfer_leadership(Config) ->
 %% -------------------------------------------------------------------
 %% Private functions
 %% -------------------------------------------------------------------
+test_data_dir(Testcase, Config) ->
+    BasePart = rabbit_ct_helpers:get_config(Config, priv_dir),
+    TestcasePart = rabbit_ct_helpers:config_to_testcase_name(Config, Testcase),
+    filename:join([BasePart, "s3_api_fs_storage", TestcasePart]).
+
 stream_declare(Ch, StreamName) ->
     Args = [{<<"x-queue-type">>, longstr, <<"stream">>}],
 

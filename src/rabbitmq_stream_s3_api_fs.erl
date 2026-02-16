@@ -64,12 +64,16 @@ get(_Connection, Key, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     with_timeout(Timeout, fun() ->
         ?LOG_INFO("Trying to find file ~p in : ~p", [Key, data_dir()]),
-        FilePath = key_to_path(Key),
-        case filelib:wildcard(binary_to_list(FilePath)) of
-            [Filename] ->
-                {ok, file:read_file(Filename)};
-            [] ->
-                {error, not_found}
+        case key_to_path(Key) of
+            {error, path_not_set} = E ->
+                E;
+            FilePath ->
+                case filelib:wildcard(binary_to_list(FilePath)) of
+                    [Filename] ->
+                        file:read_file(Filename);
+                    [] ->
+                        {error, not_found}
+                end
         end
     end).
 
@@ -78,17 +82,26 @@ get(_Connection, Key, Opts) ->
 get_range(_Connection, Key, RangeSpec, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     with_timeout(Timeout, fun() ->
-        FilePath = key_to_path(Key),
-        case filelib:wildcard(binary_to_list(FilePath)) of
-            [Filename] ->
-                #file_info{size=FileSize} = file:read_file_info(Filename),
-                {ok, Fd} = file:open(Filename, [read, binary]),
-                {Location, Number} = range_spec_to_location_number(FileSize, RangeSpec),
-                {ok, Data} = file:pread(Fd, Location, Number),
-                file:close(Fd),
-                {ok, Data};
-            [] ->
-                {error, not_found}
+        case key_to_path(Key) of
+            {error, path_not_set} = E ->
+                E;
+            FilePath ->
+                case filelib:wildcard(binary_to_list(FilePath)) of
+                    [Filename] ->
+                        {ok, #file_info{size=FileSize}} = file:read_file_info(Filename),
+                        {ok, Fd} = file:open(Filename, [read, binary]),
+                        {Location, Number} = range_spec_to_location_number(FileSize, RangeSpec),
+                        Result = case file:pread(Fd, Location, Number) of
+                            {ok, Data} ->
+                                {ok, Data};
+                            eof ->
+                                {ok, <<>>}
+                        end,
+                        file:close(Fd),
+                        Result;
+                    [] ->
+                        {error, not_found}
+                end
         end
     end).
 
@@ -98,11 +111,15 @@ put(_Connection, Key, Data, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     with_timeout(Timeout, fun() ->
         ?LOG_INFO("Writing file ~p in : ~p", [Key, data_dir()]),
-        FilePath = key_to_path(Key),
-        filelib:ensure_path(filename:dirname(FilePath)),
-        Result = file:write_file(FilePath, Data),
-        ?LOG_INFO("Write result: ~p", [Result]),
-        Result
+        case key_to_path(Key) of
+            {error, path_not_set} = E ->
+                E;
+            FilePath ->
+                filelib:ensure_path(filename:dirname(FilePath)),
+                Result = file:write_file(FilePath, Data),
+                ?LOG_INFO("Write result: ~p", [Result]),
+                Result
+        end
     end).
 
 -spec delete(connection(), key() | [key()], rabbitmq_stream_s3_api:request_opts()) ->
@@ -114,9 +131,14 @@ delete(_Connection, Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
     with_timeout(Timeout, fun() ->
         Result = lists:filtermap(
                     fun (K) ->
-                        case file:delete(key_to_path(K)) of
-                            ok -> false;
-                            Error -> {true, {K, Error}}
+                        case key_to_path(K) of
+                            {error, path_not_set} = E ->
+                                {true, {K, E}};
+                            FilePath ->
+                                case file:delete(FilePath) of
+                                    ok -> false;
+                                    Error -> {true, {K, Error}}
+                                end
                         end
                     end,
                     Keys),
@@ -157,12 +179,15 @@ set_data_dir(DataDir) ->
 
 -spec data_dir() -> binary().
 data_dir() ->
-    {ok, Dir} = application:get_env(rabbitmq_stream_s3, api_fs_data_dir),
-    Dir.
+    application:get_env(rabbitmq_stream_s3, api_fs_data_dir, undefined).
 
--spec key_to_path(rabbitmq_stream_s3_api:key()) -> binary().
+-spec key_to_path(rabbitmq_stream_s3_api:key()) -> {ok, binary()} | {error, path_not_set}.
 key_to_path(Key) ->
-    filename:join(data_dir(), Key).
+    case data_dir() of
+        undefined -> {error, path_not_set};
+        DataDir ->
+            filename:join(DataDir, Key)
+    end.
 
 with_timeout(Timeout, Fun) ->
     Self = self(),
